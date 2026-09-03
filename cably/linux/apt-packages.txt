@@ -17,11 +17,15 @@
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 #
 # Ubuntu 24.04 packages needed to build, test and package Cably Desktop on Linux.
-# One package per line; "#" comments and blank lines are ignored.  This is the SAME
-# set cably/linux/Dockerfile.build installs (cably/tests/linux-ci.sh asserts the two
-# never drift); .github/workflows/linux.yml installs from this file:
+# One package per line; '#' comments and blank lines are ignored.  Consumed by
+# .github/workflows/linux.yml (grep -vE '^\s*(#|$)' | xargs apt-get install) and kept
+# identical to the RUN apt-get install list in cably/linux/Dockerfile.build —
+# cably/tests/linux-ci.sh fails when the two drift.
 #
-#   grep -vE '^\s*(#|$)' cably/linux/apt-packages.txt | xargs sudo apt-get install -y --no-install-recommends
+# Derived from KiCad 10's top-level find_package() calls plus what the Cably additions and
+# the test scripts need: libsecret (Linux secret store), clang (the unit tests are built
+# standalone with clang++ like on macOS), xvfb/xauth (launch test), python3/curl/lsof
+# (bridge.sh's mock cloud + loopback checks), file/dpkg-dev (packaging).
 
 # toolchain
 build-essential
