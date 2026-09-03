@@ -1,3 +1,127 @@
+diff --git a/kicad-mac-builder/bin/package.sh b/kicad-mac-builder/bin/package.sh
+index b059e7f..8c599a2 100755
+--- a/kicad-mac-builder/bin/package.sh
++++ b/kicad-mac-builder/bin/package.sh
+@@ -40,7 +40,13 @@ setup_dmg()
+     if [ -e "${TEMPLATE}" ]; then
+         rm "${TEMPLATE}"
+     fi
+-    tar xf "${PACKAGING_DIR}"/"${TEMPLATE}".tar.bz2
++    # Cably F6: the product template lives in the fork (cably/toolchain/dmg/); when
++    # CABLY_DMG_TEMPLATE names its tarball, use it instead of KiCad's PACKAGING_DIR one.
++    if [ -n "${CABLY_DMG_TEMPLATE}" ]; then
++        tar xf "${CABLY_DMG_TEMPLATE}"
++    else
++        tar xf "${PACKAGING_DIR}"/"${TEMPLATE}".tar.bz2
++    fi
+     if [ ! -e "${TEMPLATE}" ]; then
+         echo "Unable to find ${TEMPLATE}"
+         exit 1
+@@ -49,9 +55,9 @@ setup_dmg()
+     # resize the template, and mount it
+ 
+     if ! hdiutil resize -sectors "${DMG_SIZE}" "${TEMPLATE}"; then
+-        hdiutil resize -limits kicadtemplate.dmg # Debugging step, to see what the limits are.
++        hdiutil resize -limits "${TEMPLATE}" # Debugging step, to see what the limits are.
+         hdiutil resize -sectors 10167525 "${TEMPLATE}"
+-        hdiutil resize -limits kicadtemplate.dmg
++        hdiutil resize -limits "${TEMPLATE}"
+         if ! hdiutil resize -sectors "${DMG_SIZE}" "${TEMPLATE}"; then
+           echo "Cannot resize template dmg, exiting."
+           exit 1
+@@ -61,15 +67,26 @@ setup_dmg()
+     DEVICE=$(hdiutil attach "${TEMPLATE}" -noautoopen -nobrowse -nomount | awk '/Apple_HFS/ {print $1}')
+     mount -t hfs -o nobrowse "${DEVICE}" "${MOUNTPOINT}"
+     mdutil -i off "${MOUNTPOINT}" || true
++    # Cably F6: MOUNT_NAME is the product's volume name (what Finder shows and
++    # where the bless step below expects it under /Volumes); enforce it on the
++    # template rather than trusting whatever it was created with.
++    if ! diskutil rename "${DEVICE}" "${MOUNT_NAME}"; then
++        echo "Cannot rename the template volume to ${MOUNT_NAME}, exiting."
++        exit 1
++    fi
+ }
+ 
+ 
+ fixup_and_cleanup()
+ {
+     # update background of the DMG
+-    cp "${PACKAGING_DIR}"/background.png "${MOUNTPOINT}"/.
+-    # Rehide the background file
+-    SetFile -a V "${MOUNTPOINT}"/background.png
++    # Cably F6: our template already carries its own hidden .background.png (and the
++    # .DS_Store that references it); KiCad's background.png must not ride along.
++    if [ -z "${CABLY_DMG_TEMPLATE}" ]; then
++        cp "${PACKAGING_DIR}"/background.png "${MOUNTPOINT}"/.
++        # Rehide the background file
++        SetFile -a V "${MOUNTPOINT}"/background.png
++    fi
+ 
+     # Retry up to 5 times, increasing wait each time
+     DETACHED=0
+@@ -165,6 +182,7 @@ echo "KICAD_SOURCE_DIR: ${KICAD_SOURCE_DIR}"
+ echo "KICAD_INSTALL_DIR: ${KICAD_INSTALL_DIR}"
+ echo "VERBOSE: ${VERBOSE}"
+ echo "TEMPLATE: ${TEMPLATE}"
++echo "CABLY_DMG_TEMPLATE: ${CABLY_DMG_TEMPLATE}"
+ echo "DMG_DIR: ${DMG_DIR}"
+ echo "PACKAGE_TYPE: ${PACKAGE_TYPE}"
+ if [ -n "${RELEASE_NAME}" ]; then # if RELEASE_NAME is unset, or is set to empty string
+@@ -189,6 +207,16 @@ if [ -z "${TEMPLATE}" ]; then
+     exit 1
+ fi
+ 
++if [ -n "${CABLY_DMG_TEMPLATE}" ]; then
++    if [ ! -f "${CABLY_DMG_TEMPLATE}" ]; then
++        echo "CABLY_DMG_TEMPLATE is set but ${CABLY_DMG_TEMPLATE} does not exist."
++        exit 1
++    fi
++    # the tarball holds <name>.dmg; TEMPLATE is that name (cablytemplate.dmg)
++    TEMPLATE="$(basename "${CABLY_DMG_TEMPLATE}" .tar.bz2)"
++    echo "TEMPLATE (from CABLY_DMG_TEMPLATE): ${TEMPLATE}"
++fi
++
+ if [ -z "${DMG_DIR}" ]; then
+     echo "DMG_DIR must be set."
+     exit 1
+@@ -233,12 +261,20 @@ case "${PACKAGE_TYPE}" in
+     ;;
+     unified)
+         KICAD_GIT_REV=$(cd "${KICAD_SOURCE_DIR}" && git rev-parse --short HEAD)
+-        MOUNT_NAME='KiCad'
++        # Cably F6: the DMG presents the product name only; the upstream mark stays attribution.
++        # Version = KICAD_SEMANTIC_VERSION of the built app (CFBundleShortVersionString
++        # up to the first "-", i.e. the tag CMake's KiCadVersion.cmake derived it from).
++        MOUNT_NAME='Cably Desktop'
++        PRODUCT_DIR='Cably Desktop'
+         DMG_SIZE=15567525
++        KICAD_VERSION=$(/usr/libexec/PlistBuddy -c "Print CFBundleShortVersionString" "${KICAD_INSTALL_DIR}/KiCad.app/Contents/Info.plist" 2>/dev/null | sed 's/-.*//')
++        if [ -z "${KICAD_VERSION}" ]; then
++            KICAD_VERSION=$(cd "${KICAD_SOURCE_DIR}" && git describe --tags --abbrev=0 2>/dev/null || echo unknown)
++        fi
+         if [ -z "$RELEASE_NAME" ]; then
+-            DMG_NAME=kicad-unified-"${NOW}"-"${KICAD_GIT_REV}".dmg
++            DMG_NAME=cably-desktop-"${KICAD_VERSION}"-"${NOW}"-"${KICAD_GIT_REV}".dmg
+         else
+-            DMG_NAME=kicad-unified-"${RELEASE_NAME}".dmg
++            DMG_NAME=cably-desktop-"${RELEASE_NAME}".dmg
+         fi
+     ;;
+     *)
+@@ -258,10 +294,10 @@ case "${PACKAGE_TYPE}" in
+       exit 1
+     ;;
+     unified)
+-        mkdir -p "${MOUNTPOINT}"/KiCad
+-        rsync -al "${KICAD_INSTALL_DIR}"/* "${MOUNTPOINT}"/KiCad/. # IMPORTANT: must preserve symlinks
++        mkdir -p "${MOUNTPOINT}/${PRODUCT_DIR}"
++        rsync -al "${KICAD_INSTALL_DIR}"/* "${MOUNTPOINT}/${PRODUCT_DIR}"/. # IMPORTANT: must preserve symlinks
+         echo "Moving demos"
+-        mv "${MOUNTPOINT}"/KiCad/demos "${MOUNTPOINT}"/
++        mv "${MOUNTPOINT}/${PRODUCT_DIR}"/demos "${MOUNTPOINT}"/
+     ;;
+     *)
+         echo "PACKAGE_TYPE must be \"unified\"."
 diff --git a/kicad-mac-builder/kicad.cmake b/kicad-mac-builder/kicad.cmake
 index 3a672b2..226cd4f 100644
 --- a/kicad-mac-builder/kicad.cmake
@@ -67,11 +191,19 @@ index b412e16..3705f31 100644
          LDFLAGS=-L/usr/local/opt/bison/lib
      BUILD_COMMAND  ${BIN_DIR}/run-with-path.sh ${CMAKE_MAKE_PROGRAM} /usr/local/opt/bison/bin:$ENV{PATH}
 diff --git a/kicad-mac-builder/package_kicad_unified.cmake b/kicad-mac-builder/package_kicad_unified.cmake
-index 8f5b4f2..5445713 100644
+index 8f5b4f2..96e073e 100644
 --- a/kicad-mac-builder/package_kicad_unified.cmake
 +++ b/kicad-mac-builder/package_kicad_unified.cmake
-@@ -6,7 +6,8 @@ endif()
+@@ -4,9 +4,16 @@ else()
+     set(PACKAGE_KICAD_SOURCE_DIR ${KICAD_SOURCE_DIR})
+ endif()
  
++# Cably F6: the DMG template (volume "Cably Desktop", background, icon layout) is
++# kept in the fork; package.sh reads it from CABLY_DMG_TEMPLATE. Override with
++# -DCABLY_DMG_TEMPLATE=/path/to/other.dmg.tar.bz2 (empty string = KiCad's template).
++set(CABLY_DMG_TEMPLATE "${PACKAGE_KICAD_SOURCE_DIR}/cably/toolchain/dmg/cablytemplate.dmg.tar.bz2"
++    CACHE FILEPATH "Tarball holding the DMG template image (<name>.dmg) package.sh starts from")
++
  ExternalProject_Add(
      package-kicad-unified
 -    DEPENDS kicad symbols docs footprints templates packages3d
@@ -80,3 +212,11 @@ index 8f5b4f2..5445713 100644
      PREFIX package-kicad-unified
      DOWNLOAD_COMMAND ""
      UPDATE_COMMAND   ""
+@@ -18,6 +25,7 @@ ExternalProject_Add(
+                     KICAD_SOURCE_DIR=${PACKAGE_KICAD_SOURCE_DIR}
+                     KICAD_INSTALL_DIR=${KICAD_INSTALL_DIR}
+                     TEMPLATE=kicadtemplate.dmg
++                    CABLY_DMG_TEMPLATE=${CABLY_DMG_TEMPLATE}
+                     PACKAGE_TYPE=unified
+                     DMG_DIR=${DMG_DIR}
+                     RELEASE_NAME=${RELEASE_NAME}

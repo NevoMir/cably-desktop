@@ -53,14 +53,75 @@ exits 1 for `nightly`/`extras`); only `package-kicad-unified` packages. The patc
 in this directory trims that target's DEPENDS to `kicad symbols footprints
 templates` (no multi-GB 3D models, no docs) for a dev DMG:
 
-    ./build.py … --target package-kicad-unified   (same flags as the app build)
+    ./build.py … --target package-kicad-unified --jobs 4   (same flags as the app build)
 
-Output: `<build-dir>/dmg/kicad-unified-<date>-<rev>.dmg` (272 MB compressed):
-a `KiCad/` folder holding `KiCad.app` and the `Cably *.app` launcher symlinks,
-`org.cably.desktop`, `kicad-cli` 10.0.6, 224 symbol files, 155 footprint dirs,
-no 3D models. Verified by mounting, launching from the mount, and running
-`kicad-cli version` from it. Still to do in F6 proper: the DMG's volume name,
-folder name, background and file name come from KiCad's template
-(`nightly-packaging/kicadtemplate.dmg.tar.bz2`) and still say KiCad; Developer
-ID signing + notarization (the ad-hoc sign step is tolerated); 3D models as a
-separate package.
+The packaging step is a CMake ExternalProject too: to re-run it after the app
+was rebuilt, delete its stamps first:
+
+    rm -f <build-dir>/package-kicad-unified/src/package-kicad-unified-stamp/package-kicad-unified-* \
+          <build-dir>/CMakeFiles/package-kicad-unified-complete
+
+Output: `<build-dir>/dmg/cably-desktop-<kicad version>-<date>-<rev>.dmg` (~270 MB
+compressed): the product folder holding `KiCad.app` (the bundle directory the
+toolchain addresses by that path; its identity is org.cably.desktop / "Cably
+Desktop"), `kicad-cli` 10.0.6, the `Cably Desktop.app` and `Cably *.app` launcher
+symlinks, the symbol and footprint libraries, no 3D models; `demos/` next to it.
+Still to do: Developer ID signing + notarization (the ad-hoc sign step is
+tolerated); 3D models as a separate package.
+
+## The DMG presents "Cably Desktop" (F6, 2026-09-03)
+
+`bin/package.sh` never designs the installer window: it untars a TEMPLATE image,
+grows it (`hdiutil resize`), mounts it, rsyncs the app into the product folder and
+converts the result to a compressed read-only DMG. Volume name, folder name,
+background, volume icon and icon layout all come from that template — KiCad's
+(`unified-packaging/kicadtemplate.dmg.tar.bz2`) says KiCad everywhere. Ours lives
+in the fork:
+
+    cably/toolchain/dmg/cablytemplate.dmg.tar.bz2   (~158 KB; a 200 MB HFS+ UDRW image)
+    cably/toolchain/dmg/make-template.sh            regenerates it, no Finder needed
+    cably/toolchain/dmg/make-ds-store.py            writes/dumps the Finder .DS_Store
+    cably/icons/src/dmg-background.svg              the window background (660x400)
+
+Template contents (volume "Cably Desktop"): `Applications -> /Applications`,
+`Cably Desktop/` (package.sh fills it), `demos/`, `.background.png` (rendered
+from the SVG with rsvg-convert), `.VolumeIcon.icns` (= `kicad/kicad.icns`, the
+Cably mark; custom-icon flag set on the root), and a `.DS_Store` written by
+`make-ds-store.py` — the same Buddy-allocator/B-tree layout the ds_store +
+mac_alias libraries (dmgbuild) produce: window {{100,100},{660,400}}, no
+toolbar/sidebar, icon view 96 px, background = an Alias-v2 record of
+`.background.png` on the volume (verified to resolve through
+`CFURLCreateBookmarkDataFromAliasRecord` + `URL(resolvingBookmarkData:)` while
+the image is mounted at /Volumes/Cably Desktop), icons at Cably Desktop (165,170),
+Applications (495,170), demos (330,300).
+
+Patch hunks (in `kicad-mac-builder-macos26.patch`):
+
+- `package_kicad_unified.cmake`: cache var `CABLY_DMG_TEMPLATE` defaulting to
+  `<kicad source dir>/cably/toolchain/dmg/cablytemplate.dmg.tar.bz2` (with
+  `--kicad-source-dir` that is this fork), passed to package.sh as an env var.
+  build.py has no flag for the toolchain's own cache, so to override it edit the
+  cache once — `cmake -DCABLY_DMG_TEMPLATE=/path/to/other.dmg.tar.bz2 <build-dir>` —
+  and later build.py runs keep it; the empty string falls back to KiCad's template.
+- `bin/package.sh`: when `CABLY_DMG_TEMPLATE` is set, untar it (TEMPLATE becomes
+  its basename minus `.tar.bz2`), skip the `PACKAGING_DIR/background.png` copy
+  (ours is in the template), `MOUNT_NAME='Cably Desktop'` and the mounted template
+  volume is RENAMED to it (`diskutil rename`, in place) so MOUNT_NAME really is the
+  volume name Finder shows — mutation check: MOUNT_NAME reverted to the upstream
+  value makes `dmg.sh` fail on the volume name —, the product folder is
+  `Cably Desktop/` (demos still moved next to it), and the file name is
+  `cably-desktop-<KICAD_SEMANTIC_VERSION>-<yyyymmdd-hhmmss>-<git rev>.dmg`
+  (version = the built app's CFBundleShortVersionString up to the first `-`,
+  i.e. the tag `cmake/KiCadVersion.cmake` derives KICAD_SEMANTIC_VERSION from;
+  `git describe --abbrev=0` as fallback). `RELEASE_NAME` gives
+  `cably-desktop-<RELEASE_NAME>.dmg`.
+
+Acceptance: `cably/tests/dmg.sh [file.dmg]` (default: newest under
+`<build-dir>/dmg`) mounts read-only at a private mountpoint and asserts the file
+name, volume name, top level (folder, Applications link, nothing named KiCad),
+the bundle id inside, that the background is the render of our SVG and not
+KiCad's, the volume icon, the .DS_Store names, and that the app launches from
+the mount (alive after 12 s, exits on SIGTERM). What still says KiCad inside
+the image is attribution or a path the toolchain hard-codes: the `KiCad.app`
+bundle directory inside the product folder, `kicad-cli`, and the About/NOTICE
+texts.
