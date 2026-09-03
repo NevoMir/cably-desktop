@@ -28,10 +28,12 @@ BIN="$APP/Contents/MacOS/kicad"
 # (a) ------------------------------------------------------------------------
 for s in "Describe the circuit you want" "Recent projects" "Cably Desktop" \
          "Sign in to Cably to generate (coming in the next phase)"; do
-  if strings - "$BIN" | grep -qF "$s"; then ok "binary carries \"$s\""; else bad "binary lacks \"$s\""; fi
+  # grep -F without -q: with pipefail, grep -q exiting early gives strings SIGPIPE and
+  # the pipeline a non-zero status even on a match (measured 2026-09-03: false FAILs).
+  if strings - "$BIN" | grep -F "$s" >/dev/null; then ok "binary carries \"$s\""; else bad "binary lacks \"$s\""; fi
 done
 if [ -x "$OFFICIAL/Contents/MacOS/kicad" ]; then
-  if strings - "$OFFICIAL/Contents/MacOS/kicad" | grep -qF "Describe the circuit you want"; then
+  if strings - "$OFFICIAL/Contents/MacOS/kicad" | grep -F "Describe the circuit you want" >/dev/null; then
     bad "negative control: official KiCad already contains the prompt string — assertion vacuous"
   else ok "negative control: official KiCad lacks the prompt string"; fi
 else echo "  skip negative control: no official KiCad at $OFFICIAL"; fi

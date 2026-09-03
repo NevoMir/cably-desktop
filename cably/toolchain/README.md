@@ -31,3 +31,17 @@ Acceptance (F1): the app launches; `KiCad.app/Contents/MacOS/kicad-cli pcb expor
 on the D1 fixture board is byte-identical to the official KiCad's output modulo version/date
 headers (20/21 files; the .gbrjob embeds the version), and `sch export netlist` has identical
 node membership on all 28 nets.
+
+Incremental rebuild after source changes: kicad-mac-builder drives KiCad as a CMake
+ExternalProject WITHOUT `BUILD_ALWAYS`, so once `<build-dir>/kicad/src/kicad-stamp/kicad-build`
+exists a second `build.py` run reports "Build complete" in ~20 s without compiling anything.
+Delete the stamps of the steps that must rerun, then run the same command:
+
+    rm <build-dir>/kicad/src/kicad-stamp/kicad-{build,install,install-*-into-app,collect-licenses,sign-app,done}
+
+(keep `kicad-configure`: the inner `make` re-runs CMake by itself when a CMakeLists changes).
+An incremental install does not remove files it no longer generates — e.g. the pre-F2
+`PCB Editor.app` launcher symlinks in `kicad-dest/` — delete those by hand.
+The sign-app step is tolerant on purpose: `codesign --sign -` with entitlements fails on
+macOS 26 for the embedded Python.framework ("bundle format unrecognized"), the message is
+logged and the dev build keeps its linker ad-hoc signature (F6 signs with a Developer ID).

@@ -1,0 +1,68 @@
+diff --git a/kicad-mac-builder/kicad.cmake b/kicad-mac-builder/kicad.cmake
+index 3a672b2..226cd4f 100644
+--- a/kicad-mac-builder/kicad.cmake
++++ b/kicad-mac-builder/kicad.cmake
+@@ -65,7 +65,7 @@ ExternalProject_Add_Step(
+     DEPENDS docs
+     DEPENDEES install
+     COMMAND mkdir -p ${KICAD_INSTALL_DIR}/KiCad.app/Contents/SharedSupport/help/
+-    COMMAND cp -r ${docs_SOURCE_DIR}/share/doc/kicad/help/ ${KICAD_INSTALL_DIR}/KiCad.app/Contents/SharedSupport/help/
++    COMMAND sh -c "[ -d ${docs_SOURCE_DIR}/share/doc/kicad/help ] && cp -r ${docs_SOURCE_DIR}/share/doc/kicad/help/ ${KICAD_INSTALL_DIR}/KiCad.app/Contents/SharedSupport/help/ || echo 'Cably F1: no docs present, skipping help install'"
+     COMMAND find ${KICAD_INSTALL_DIR}/KiCad.app/Contents/SharedSupport/help -name "*.epub" -type f -delete
+     COMMAND find ${KICAD_INSTALL_DIR}/KiCad.app/Contents/SharedSupport/help -name "*.pdf" -type f -delete
+ )
+@@ -111,11 +111,11 @@ ExternalProject_Add_Step(
+ ExternalProject_Add_Step(
+     kicad
+     install-packages3d-into-app
+-    COMMENT "Installing packages3d into KiCad.app"
+-    DEPENDS packages3d
++    # Cably F1: the 3D-model library (multi-GB clone) is packaging-time data, not a
++    # build input. Made a no-op locally so the compile is not parked behind the clone.
++    COMMENT "Skipping 3D models (Cably: packaged separately in F6)"
++    COMMAND ${CMAKE_COMMAND} -E true
+     DEPENDEES install
+-    COMMAND mkdir -p ${KICAD_INSTALL_DIR}/KiCad.app/Contents/SharedSupport/
+-    COMMAND cp -r ${packages3d_INSTALL_DIR}/. ${KICAD_INSTALL_DIR}/KiCad.app/Contents/SharedSupport/
+ )
+ 
+ # if cmake REDISTRIBUTABLE is set, then do this step
+@@ -137,7 +137,10 @@ if(DEFINED REDISTRIBUTABLE)
+             COMMENT "Signing KiCad.app and its contents"
+             DEPENDEES fix-loading
+             # we can't modify KiCad.app after this without resigning
+-            COMMAND "${BIN_DIR}/apple.py" sign --certificate-id "${SIGNING_CERTIFICATE_ID}" ${HARDENED_RUNTIME_ARG} --entitlements "${BIN_DIR}/../signing/entitlements.plist" "${KICAD_INSTALL_DIR}/KiCad.app"
++            # Cably F1: tolerant. Ad-hoc signing with entitlements fails on macOS 26 for the
++            # embedded Python.framework ("bundle format unrecognized"); dev builds stay
++            # linker ad-hoc-signed, F6 signs with a Developer ID.
++            COMMAND sh -c "'${BIN_DIR}/apple.py' sign --certificate-id '${SIGNING_CERTIFICATE_ID}' ${HARDENED_RUNTIME_ARG} --entitlements '${BIN_DIR}/../signing/entitlements.plist' '${KICAD_INSTALL_DIR}/KiCad.app' || echo 'Cably F1: signing failed, keeping the linker ad-hoc signature (dev build)'"
+     )
+ else()
+     ExternalProject_Add_Step(
+@@ -146,7 +149,10 @@ else()
+             COMMENT "Signing KiCad.app and its contents"
+             DEPENDEES install-docs-into-app install collect-licenses install-footprints-into-app install-symbols-into-app install-templates-into-app install-packages3d-into-app # demos?
+             # we can't modify KiCad.app after this without resigning
+-            COMMAND "${BIN_DIR}/apple.py" sign --certificate-id "${SIGNING_CERTIFICATE_ID}" ${HARDENED_RUNTIME_ARG} --entitlements "${BIN_DIR}/../signing/entitlements.plist" "${KICAD_INSTALL_DIR}/KiCad.app"
++            # Cably F1: tolerant. Ad-hoc signing with entitlements fails on macOS 26 for the
++            # embedded Python.framework ("bundle format unrecognized"); dev builds stay
++            # linker ad-hoc-signed, F6 signs with a Developer ID.
++            COMMAND sh -c "'${BIN_DIR}/apple.py' sign --certificate-id '${SIGNING_CERTIFICATE_ID}' ${HARDENED_RUNTIME_ARG} --entitlements '${BIN_DIR}/../signing/entitlements.plist' '${KICAD_INSTALL_DIR}/KiCad.app' || echo 'Cably F1: signing failed, keeping the linker ad-hoc signature (dev build)'"
+     )
+ endif()
+ 
+diff --git a/kicad-mac-builder/ngspice.cmake b/kicad-mac-builder/ngspice.cmake
+index b412e16..3705f31 100644
+--- a/kicad-mac-builder/ngspice.cmake
++++ b/kicad-mac-builder/ngspice.cmake
+@@ -8,7 +8,9 @@ ExternalProject_Add(
+     UPDATE_COMMAND      ""
+     PATCH_COMMAND       ""
+     CONFIGURE_COMMAND ./autogen.sh
+-    COMMAND ./configure --prefix=${ngspice_INSTALL_DIR} --with-ngshared
++    # Cably F1: Xcode 26 / Apple clang 21 hard-errors on ngspice's cppduals
++    # specialising std::is_compound (-Winvalid-specialization). Downgrade it.
++    COMMAND ./configure --prefix=${ngspice_INSTALL_DIR} --with-ngshared CXXFLAGS=-Wno-invalid-specialization CFLAGS=-Wno-invalid-specialization
+         --enable-xspice --enable-cider --disable-debug --disable-openmp
+         LDFLAGS=-L/usr/local/opt/bison/lib
+     BUILD_COMMAND  ${BIN_DIR}/run-with-path.sh ${CMAKE_MAKE_PROGRAM} /usr/local/opt/bison/bin:$ENV{PATH}
