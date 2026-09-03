@@ -46,13 +46,13 @@
 #define CABLY_WEBSITE_URL "https://cably.dev"
 
 /// Where the Complete Corresponding Source of THIS build is published (GPLv3 s6).
-/// PLACEHOLDER until F7 (publishing): F7 must replace it with the real, reachable
+///  until F7 (publishing): F7 must replace it with the real, reachable
 /// repository/tag URL before any binary is distributed.
-#define CABLY_SOURCE_URL "https://cably.dev/desktop/source"
+#define CABLY_SOURCE_URL "https://github.com/NevoMir/cably-desktop"
 
 /// Bug reports for Cably Desktop go here, never to KiCad's tracker or forum.
-/// PLACEHOLDER until F7.
-#define CABLY_BUGS_URL "https://cably.dev/desktop/issues"
+///  until F7.
+#define CABLY_BUGS_URL "https://github.com/NevoMir/cably-desktop/issues"
 
 /// Public cloud endpoints and the public Supabase key used by the F4 cloud bridge
 /// (cably/src/cably_bridge.h). Row-level security + the user's bearer token gate every

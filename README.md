@@ -1,3 +1,23 @@
+# Cably Desktop
+
+**Cably Desktop** is the desktop app for [cably.dev](https://cably.dev): a fork of
+[KiCad](https://www.kicad.org) that opens the projects you generate on Cably in KiCad's
+real editors and syncs your edits back. It is **based on KiCad**; it is not KiCad and is not
+affiliated with or endorsed by the KiCad project. "KiCad" is a registered trademark of
+LF Projects, LLC.
+
+- Licence: GNU General Public License v3.0 or later, like KiCad (see `LICENSE.README`).
+  This repository is the complete corresponding source for every Cably Desktop build.
+- What Cably changed: everything under `cably/`, plus the edits recorded in `CHANGES.md`
+  (the GPLv3 §5(a) record). Upstream KiCad's copyright and notices are unchanged.
+- Build on macOS: `cably/toolchain/README.md`. Tests: `cably/tests/`.
+- Cably's cloud services are separate, closed-source products; this app talks to them
+  over HTTPS with a public key and nothing more.
+
+The original KiCad README follows.
+
+---
+
 # KiCad README
 
 For specific documentation about [building KiCad](https://dev-docs.kicad.org/en/build/), policies
