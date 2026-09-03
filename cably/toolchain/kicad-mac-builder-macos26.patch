@@ -66,3 +66,17 @@ index b412e16..3705f31 100644
          --enable-xspice --enable-cider --disable-debug --disable-openmp
          LDFLAGS=-L/usr/local/opt/bison/lib
      BUILD_COMMAND  ${BIN_DIR}/run-with-path.sh ${CMAKE_MAKE_PROGRAM} /usr/local/opt/bison/bin:$ENV{PATH}
+diff --git a/kicad-mac-builder/package_kicad_unified.cmake b/kicad-mac-builder/package_kicad_unified.cmake
+index 8f5b4f2..5445713 100644
+--- a/kicad-mac-builder/package_kicad_unified.cmake
++++ b/kicad-mac-builder/package_kicad_unified.cmake
+@@ -6,7 +6,8 @@ endif()
+ 
+ ExternalProject_Add(
+     package-kicad-unified
+-    DEPENDS kicad symbols docs footprints templates packages3d
++    # Cably F6-lite: no 3D models (multi-GB, packaged separately later) and no docs in the dev DMG.
++    DEPENDS kicad symbols footprints templates
+     PREFIX package-kicad-unified
+     DOWNLOAD_COMMAND ""
+     UPDATE_COMMAND   ""

@@ -45,3 +45,22 @@ An incremental install does not remove files it no longer generates — e.g. the
 The sign-app step is tolerant on purpose: `codesign --sign -` with entitlements fails on
 macOS 26 for the embedded Python.framework ("bundle format unrecognized"), the message is
 logged and the dev build keeps its linker ad-hoc signature (F6 signs with a Developer ID).
+
+## Unsigned dev DMG (F6-lite, 2026-09-03)
+
+The toolchain's `package-kicad-nightly` target is disabled upstream (its script
+exits 1 for `nightly`/`extras`); only `package-kicad-unified` packages. The patch
+in this directory trims that target's DEPENDS to `kicad symbols footprints
+templates` (no multi-GB 3D models, no docs) for a dev DMG:
+
+    ./build.py … --target package-kicad-unified   (same flags as the app build)
+
+Output: `<build-dir>/dmg/kicad-unified-<date>-<rev>.dmg` (272 MB compressed):
+a `KiCad/` folder holding `KiCad.app` and the `Cably *.app` launcher symlinks,
+`org.cably.desktop`, `kicad-cli` 10.0.6, 224 symbol files, 155 footprint dirs,
+no 3D models. Verified by mounting, launching from the mount, and running
+`kicad-cli version` from it. Still to do in F6 proper: the DMG's volume name,
+folder name, background and file name come from KiCad's template
+(`nightly-packaging/kicadtemplate.dmg.tar.bz2`) and still say KiCad; Developer
+ID signing + notarization (the ad-hoc sign step is tolerated); 3D models as a
+separate package.
