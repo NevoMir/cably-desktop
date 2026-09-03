@@ -25,7 +25,7 @@
  * Everything user-visible that names the product goes through these, so the
  * name is defined once. KiCad attribution ("based on KiCad") is REQUIRED by the
  * KiCad trademark policy and by GPLv3 s5/s6 and must not be removed. The
- * product is never called "Cably KiCad".
+ * product name never combines "Cably" with the KiCad mark.
  *
  * No secrets, no cloud endpoints: this header ships in the published source.
  */
