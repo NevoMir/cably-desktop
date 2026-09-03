@@ -9,10 +9,15 @@
 #  (b) The app launches (open -a), is still alive after 12 s (a home panel that
 #      crashes the manager on construction fails here), and quits cleanly via
 #      osascript addressed by the bundle id read from the built Info.plist.
-#  (c) The pure recent-projects helper (cably/src/cably_home_recent.h) passes
-#      its unit test, compiled standalone against the toolchain's wxWidgets
-#      (KICAD_BUILD_QA_TESTS is OFF in the kicad-mac-builder build, so a qa/
-#      Boost target would never run; this is the cheap equivalent).
+#  (c) The pure helpers (cably/src/cably_home_recent.h, and since F4
+#      cably/src/cably_home_cloud.h: project stem, ISO timestamps, "updated"
+#      wording, generate URL) pass their unit tests, compiled standalone
+#      against the toolchain's wxWidgets (KICAD_BUILD_QA_TESTS is OFF in the
+#      kicad-mac-builder build, so a qa/ Boost target would never run; this is
+#      the cheap equivalent).
+#  F4 (home panel <-> bridge) extends (a): the binary must carry the sign-in,
+#      projects-list, waiting, conflict and generate-on-web strings, and must
+#      NOT carry the F3 placeholder "coming in the next phase" any more.
 set -uo pipefail
 FORK="$(cd "$(dirname "$0")/../.." && pwd)"
 BUILD="${CABLY_BUILD_DIR:-$FORK/../build.noindex}"
@@ -27,11 +32,15 @@ BIN="$APP/Contents/MacOS/kicad"
 
 # (a) ------------------------------------------------------------------------
 for s in "Describe the circuit you want" "Recent projects" "Cably Desktop" \
-         "Sign in to Cably to generate (coming in the next phase)"; do
+         "Sign in to Cably" "Your Cably projects" "Generates on cably.dev" \
+         "Waiting for the browser" "Signed in as" \
+         "This project was edited here since Cably last exported it"; do
   # grep -F without -q: with pipefail, grep -q exiting early gives strings SIGPIPE and
   # the pipeline a non-zero status even on a match (measured 2026-09-03: false FAILs).
   if strings - "$BIN" | grep -F "$s" >/dev/null; then ok "binary carries \"$s\""; else bad "binary lacks \"$s\""; fi
 done
+# F4 retired the F3 placeholder: a binary that still carries it is a stale build.
+if strings - "$BIN" | grep -F "coming in the next phase" >/dev/null; then bad "binary still carries the F3 placeholder \"coming in the next phase\" (stale build?)"; else ok "F3 placeholder gone"; fi
 if [ -x "$OFFICIAL/Contents/MacOS/kicad" ]; then
   if strings - "$OFFICIAL/Contents/MacOS/kicad" | grep -F "Describe the circuit you want" >/dev/null; then
     bad "negative control: official KiCad already contains the prompt string — assertion vacuous"
@@ -42,12 +51,14 @@ else echo "  skip negative control: no official KiCad at $OFFICIAL"; fi
 if [ -x "$WXCONFIG" ]; then
   T=$(mktemp -d)
   WXLIB="$("$WXCONFIG" --prefix)/lib"
-  if clang++ -std=c++17 -I"$FORK/cably/src" $("$WXCONFIG" --cxxflags) \
-        "$FORK/cably/tests/unit/test_cably_home_recent.cpp" \
-        $("$WXCONFIG" --libs base) -Wl,-rpath,"$WXLIB" -o "$T/test_recent" 2>"$T/cc.log"; then
-    if "$T/test_recent" >"$T/run.log" 2>&1; then ok "unit test: $(tail -1 "$T/run.log")"
-    else bad "unit test failed:"; sed 's/^/       /' "$T/run.log" | tail -20; fi
-  else bad "unit test did not compile:"; sed 's/^/       /' "$T/cc.log" | head -20; fi
+  for t in test_cably_home_recent test_cably_home_cloud; do
+    if clang++ -std=c++17 -I"$FORK/cably/src" $("$WXCONFIG" --cxxflags) \
+          "$FORK/cably/tests/unit/$t.cpp" \
+          $("$WXCONFIG" --libs base) -Wl,-rpath,"$WXLIB" -o "$T/$t" 2>"$T/cc.log"; then
+      if "$T/$t" >"$T/run.log" 2>&1; then ok "unit test: $(tail -1 "$T/run.log")"
+      else bad "unit test $t failed:"; sed 's/^/       /' "$T/run.log" | tail -20; fi
+    else bad "unit test $t did not compile:"; sed 's/^/       /' "$T/cc.log" | head -20; fi
+  done
 else bad "wx-config not found at $WXCONFIG (set CABLY_WX_CONFIG)"; fi
 
 # (b) ------------------------------------------------------------------------

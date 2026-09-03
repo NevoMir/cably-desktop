@@ -36,3 +36,14 @@ target_include_directories( kicad PRIVATE ${CMAKE_CURRENT_LIST_DIR}/src )
 target_include_directories( common PRIVATE ${CMAKE_CURRENT_LIST_DIR}/src )
 target_include_directories( kicad PRIVATE ${CMAKE_CURRENT_LIST_DIR}/src )
 # ---- end F2 identity ----
+
+# ---- F4 home-f4: home panel <-> bridge (agent "home-f4") ----
+# cably/src/cably_home_cloud.h: pure helpers (project stem, Supabase timestamps, "updated"
+# wording, generate URL) behind the cloud side of the home panel; unit test
+# cably/tests/unit/test_cably_home_cloud.cpp is built standalone by cably/tests/home.sh.
+# The panel reaches the bridge (cably/src/cably_bridge.h, agent "bridge", whose sources are
+# wired by its own block) only through the adapter section at the top of cably_home_panel.cpp.
+target_sources( kicad PRIVATE
+    ${CMAKE_CURRENT_LIST_DIR}/src/cably_home_cloud.h
+    )
+# ---- end F4 home-f4 ----
