@@ -1,0 +1,177 @@
+# This file is part of Cably Desktop, a fork of KiCad, a free EDA CAD application.
+#
+# Copyright (C) 2026 Cably
+# Copyright (C) The KiCad Developers, see AUTHORS.txt for contributors.
+#
+# This program is free software: you can redistribute it and/or modify it
+# under the terms of the GNU General Public License as published by the
+# Free Software Foundation, either version 3 of the License, or (at your
+# option) any later version.
+#
+# This program is distributed in the hope that it will be useful, but
+# WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+# General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program.  If not, see <https://www.gnu.org/licenses/>.
+#
+# Linux x86_64 build of Cably Desktop on GitHub Actions (ubuntu-24.04 runner).
+#
+# The recipe lives in cably/linux/ and is shared with the Docker build described in
+# cably/linux/README.md; this workflow only sequences the same scripts:
+#   cably/linux/apt-packages.txt  the Ubuntu 24.04 build-depends (one per line)
+#   cably/linux/build.sh          cmake + ninja + install   (CABLY_* env knobs)
+#   cably/linux/run-tests.sh      unit tests, bridge.sh, theme.sh, launch under Xvfb
+#   cably/linux/package-deb.sh    the .deb from the install prefix
+# Nothing here must duplicate their logic.  Acceptance: cably/tests/linux-ci.sh.
+#
+# Expect the first run (cold ccache) to take 2.5-3.5 h on the 4-vCPU standard runner;
+# a warm ccache brings a no-change rebuild down to ~15-25 min.  No repository secrets are
+# needed: the release upload uses the job's own GITHUB_TOKEN.
+
+name: Linux
+
+on:
+  push:
+    branches:
+      - cably-main
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+# A newer push to the same ref supersedes a build still running for it.
+concurrency:
+  group: linux-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  CABLY_PREFIX: /opt/cably-desktop
+  CCACHE_DIR: /home/runner/.cache/ccache
+  CCACHE_MAXSIZE: 5G
+  CCACHE_COMPRESS: 'true'
+  CCACHE_COMPRESSLEVEL: '6'
+
+jobs:
+  build:
+    name: Build, test, package (.deb, x86_64)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 330
+    permissions:
+      contents: write   # the release step attaches the .deb on a v* tag
+    steps:
+      # Full history: cmake/CreateGitVersionHeader.cmake runs `git describe` for the version.
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          submodules: false
+
+      - name: Free disk space (a RelWithDebInfo tree needs ~15 GB)
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/.ghcup \
+                      /opt/hostedtoolcache/CodeQL /usr/share/swift /usr/local/share/powershell
+          df -h / /mnt 2>/dev/null || df -h /
+
+      - name: Install build dependencies (cably/linux/apt-packages.txt)
+        run: |
+          sudo apt-get update
+          grep -vE '^\s*(#|$)' cably/linux/apt-packages.txt | sed 's/[[:space:]]*#.*$//' \
+            | xargs sudo apt-get install -y --no-install-recommends ccache
+          echo "gcc: $(gcc -dumpfullversion)  cmake: $(cmake --version | head -1)  ninja: $(ninja --version)  ccache: $(ccache --version | head -1)"
+
+      - name: Compiler id and work directories
+        id: setup
+        run: |
+          echo "compiler=gcc-$(gcc -dumpfullversion)" >> "$GITHUB_OUTPUT"
+          # The build tree goes on the runner's larger scratch disk when it has one.
+          if [ -d /mnt ] && sudo mkdir -p /mnt/cably-build && sudo chown "$(id -u):$(id -g)" /mnt/cably-build; then
+            BUILD=/mnt/cably-build
+          else
+            BUILD="$RUNNER_TEMP/cably-build"; mkdir -p "$BUILD"
+          fi
+          sudo mkdir -p "$CABLY_PREFIX" && sudo chown "$(id -u):$(id -g)" "$CABLY_PREFIX"
+          mkdir -p "$CCACHE_DIR" "$GITHUB_WORKSPACE/dist"
+          {
+            echo "CABLY_FORK=$GITHUB_WORKSPACE"
+            echo "CABLY_BUILD_DIR=$BUILD"
+            echo "CABLY_JOBS=$(nproc)"
+            echo "CABLY_DEB_DIR=$GITHUB_WORKSPACE/dist"
+            echo "CABLY_CMAKE_EXTRA=-DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache"
+          } >> "$GITHUB_ENV"
+          echo "build dir: $BUILD ($(nproc) cpus)"
+
+      # ccache: restored by compiler + CMakeLists hashes (exact match first, then the
+      # newest cache of the same compiler), saved by an explicit step that runs even when
+      # the build fails or times out, so a partial compile is never thrown away.
+      - name: Restore ccache
+        id: ccache-restore
+        uses: actions/cache/restore@v4
+        with:
+          path: /home/runner/.cache/ccache
+          key: ccache-linux-x86_64-${{ steps.setup.outputs.compiler }}-${{ hashFiles('CMakeLists.txt', '**/CMakeLists.txt', 'cmake/**') }}-${{ github.run_id }}
+          restore-keys: |
+            ccache-linux-x86_64-${{ steps.setup.outputs.compiler }}-${{ hashFiles('CMakeLists.txt', '**/CMakeLists.txt', 'cmake/**') }}-
+            ccache-linux-x86_64-${{ steps.setup.outputs.compiler }}-
+
+      - name: Build and install (cably/linux/build.sh)
+        run: |
+          ccache --zero-stats >/dev/null
+          T0=$(date +%s)
+          bash cably/linux/build.sh
+          echo "build.sh wall time: $(( $(date +%s) - T0 )) s"
+          ccache --show-stats
+          du -sh "$CABLY_BUILD_DIR" "$CABLY_PREFIX" "$CCACHE_DIR"
+
+      - name: Save ccache
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: /home/runner/.cache/ccache
+          key: ${{ steps.ccache-restore.outputs.cache-primary-key }}
+
+      # run-tests.sh finds the theme.sh fixtures in cably/tests/fixtures/ by default;
+      # set CABLY_FIXTURES in the environment to point it elsewhere.
+      - name: Tests under Xvfb (cably/linux/run-tests.sh)
+        run: xvfb-run -a -s "-screen 0 1280x800x24" bash cably/linux/run-tests.sh
+
+      - name: Package .deb (cably/linux/package-deb.sh)
+        run: |
+          bash cably/linux/package-deb.sh
+          # The script writes into CABLY_DEB_DIR; collect a .deb left elsewhere as well.
+          if ! ls "$CABLY_DEB_DIR"/*.deb >/dev/null 2>&1; then
+            find "$CABLY_BUILD_DIR" "$RUNNER_TEMP" "$GITHUB_WORKSPACE" -maxdepth 3 -name '*.deb' -exec cp -v {} "$CABLY_DEB_DIR"/ \;
+          fi
+          ls "$CABLY_DEB_DIR"/*.deb
+          for d in "$CABLY_DEB_DIR"/*.deb; do
+            dpkg-deb --info "$d"
+            echo "$(dpkg-deb --contents "$d" | wc -l) entries in $(basename "$d") ($(du -h "$d" | cut -f1))"
+          done
+
+      - name: Upload the .deb
+        uses: actions/upload-artifact@v4
+        with:
+          name: cably-desktop-linux-x86_64-deb
+          path: dist/*.deb
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: GitHub Release (tags v*)
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          name: Cably Desktop ${{ github.ref_name }}
+          files: dist/*.deb
+          fail_on_unmatched_files: true
+          body: |
+            Linux x86_64 .deb for Ubuntu 24.04; based on KiCad; GPL-3.0-or-later; source = this repository
+
+            Cably Desktop ${{ github.ref_name }} for Linux x86_64, built from this repository at ${{ github.sha }} on GitHub Actions (workflow "Linux").
+            Install: `sudo apt install ./cably-desktop_*.deb`.  Corresponding source: this repository (see NOTICE.md and CHANGES.md for the record of changes from KiCad).
