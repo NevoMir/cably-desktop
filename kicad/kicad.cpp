@@ -61,6 +61,7 @@
 #include "kicad_manager_frame.h"
 
 #include <kiplatform/app.h>
+#include <cably_config.h>
 #include <kiplatform/environment.h>
 
 #ifdef KICAD_IPC_API
@@ -94,7 +95,7 @@ PGM_KICAD& PgmTop()
 
 bool PGM_KICAD::OnPgmInit()
 {
-    App().SetAppDisplayName( wxT( "KiCad" ) );
+    App().SetAppDisplayName( wxString( CABLY_PRODUCT_NAME ) );   // Cably Desktop, based on KiCad
 
 #if defined(DEBUG)
     wxString absoluteArgv0 = wxStandardPaths::Get().GetExecutablePath();
@@ -259,7 +260,7 @@ bool PGM_KICAD::OnPgmInit()
 
     if( appType == KICAD_MAIN_FRAME_T )
     {
-        managerFrame = new KICAD_MANAGER_FRAME( nullptr, wxT( "KiCad" ), wxDefaultPosition,
+        managerFrame = new KICAD_MANAGER_FRAME( nullptr, wxString( CABLY_PRODUCT_NAME ), wxDefaultPosition,
                                                 wxWindow::FromDIP( wxSize( 775, -1 ), NULL ) );
         frame = managerFrame;
 

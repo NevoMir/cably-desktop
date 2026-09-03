@@ -1,3 +1,25 @@
+#
+#  This program source code file is part of KiCad, a free EDA CAD application,
+#  as modified for Cably Desktop (based on KiCad); modifications are listed in
+#  CHANGES.md as required by GPLv3 s5(a).
+#
+#  Copyright The KiCad Developers, see AUTHORS.txt for contributors.
+#  Copyright (C) 2026 Cably <dev@cably.dev> (modifications only)
+#
+#  This program is free software: you can redistribute it and/or modify
+#  it under the terms of the GNU General Public License as published by
+#  the Free Software Foundation, either version 3 of the License, or
+#  (at your option) any later version.
+#
+#  This program is distributed in the hope that it will be useful,
+#  but WITHOUT ANY WARRANTY; without even the implied warranty of
+#  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+#  GNU General Public License for more details.
+#
+#  You should have received a copy of the GNU General Public License
+#  along with this program.  If not, see <https://www.gnu.org/licenses/>.
+#
+
 # Add all the warnings to the files
 if( COMPILER_SUPPORTS_WARNINGS )
     set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} ${WARN_FLAGS_CXX}")
@@ -106,7 +128,7 @@ if( APPLE )
         MACOSX_PACKAGE_LOCATION Resources
         )
     set( MACOSX_BUNDLE_ICON_FILE kicad.icns )
-    set( MACOSX_BUNDLE_GUI_IDENTIFIER org.kicad.kicad )
+    set( MACOSX_BUNDLE_GUI_IDENTIFIER org.cably.desktop )   # Cably Desktop, based on KiCad
     set( MACOSX_BUNDLE_NAME kicad )
 endif()
 
@@ -276,12 +298,21 @@ if( APPLE )
         endfunction( move_to_main_bundle )
 
         # move all app bundles
-        move_to_main_bundle( \"bitmap2component.app\" \"Image Converter.app\" )
-        move_to_main_bundle( \"eeschema.app\" \"Schematic Editor.app\" )
-        move_to_main_bundle( \"gerbview.app\" \"GerbView.app\" )
-        move_to_main_bundle( \"pcb_calculator.app\" \"PCB Calculator.app\" )
-        move_to_main_bundle( \"pcbnew.app\" \"PCB Editor.app\" )
-        move_to_main_bundle( \"pl_editor.app\" \"Page Layout Editor.app\" )
+        # Cably Desktop: the top-level launcher links carry the product's launcher names
+        # (they match each inner bundle's CFBundleName).
+        move_to_main_bundle( \"bitmap2component.app\" \"Cably Image Converter.app\" )
+        move_to_main_bundle( \"eeschema.app\" \"Cably Schematic Editor.app\" )
+        move_to_main_bundle( \"gerbview.app\" \"Cably Gerber Viewer.app\" )
+        move_to_main_bundle( \"pcb_calculator.app\" \"Cably PCB Calculator.app\" )
+        move_to_main_bundle( \"pcbnew.app\" \"Cably PCB Editor.app\" )
+        move_to_main_bundle( \"pl_editor.app\" \"Cably Drawing Sheet Editor.app\" )
+
+        # Cably Desktop: Finder-visible product name. The bundle directory itself stays
+        # ${OSX_BUNDLE_MAIN} because the packaging toolchain addresses it by that path;
+        # the DMG/packaging step (F6) presents it under the product name.
+        execute_process( COMMAND ${CMAKE_COMMAND} -E create_symlink \"${OSX_BUNDLE_MAIN}\" \"Cably Desktop.app\"
+            WORKING_DIRECTORY ${KICAD_BIN}
+        )
 
         cmake_policy( SET CMP0012 NEW )
         if ( ${PYTHON_FRAMEWORK_HELPER} AND ${KICAD_APPLE_MAKE_RELOCATEABLE_BUNDLE} )

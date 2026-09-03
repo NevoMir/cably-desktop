@@ -4,6 +4,7 @@
  * Copyright (C) 2017 Jean-Pierre Charras, jp.charras at wanadoo.fr
  * Copyright (C) 2013 CERN (www.cern.ch)
  * Copyright The KiCad Developers, see AUTHORS.txt for contributors.
+ * Modified by Cably, 2026 (Cably home screen) - see CHANGES.md.
  *
  * This program is free software; you can redistribute it and/or
  * modify it under the terms of the GNU General Public License
@@ -36,6 +37,7 @@
 #include <build_version.h>
 #include <confirm.h>
 #include <dialogs/panel_kicad_launcher.h>
+#include <cably_home_panel.h>
 #include <dialogs/panel_jobset.h>
 #include <dialogs/dialog_edit_cfg.h>
 #include <local_history.h>
@@ -94,6 +96,7 @@
 #endif
 
 #include "kicad_manager_frame.h"
+#include <cably_config.h>
 #include "settings/kicad_settings.h"
 
 #include <project/project_file.h>
@@ -151,6 +154,7 @@ KICAD_MANAGER_FRAME::KICAD_MANAGER_FRAME( wxWindow* parent, const wxString& titl
         m_projectTreePane( nullptr ),
         m_historyPane( nullptr ),
         m_launcher( nullptr ),
+        m_cablyHome( nullptr ),
         m_lastToolbarIconSize( 0 ),
         m_pcmButton( nullptr ),
         m_pcmUpdateCount( 0 )
@@ -158,7 +162,7 @@ KICAD_MANAGER_FRAME::KICAD_MANAGER_FRAME( wxWindow* parent, const wxString& titl
     const int defaultLeftWinWidth = FromDIP( 250 );
 
     m_leftWinWidth = defaultLeftWinWidth; // Default value
-    m_aboutTitle = "KiCad";
+    m_aboutTitle = CABLY_PRODUCT_NAME;   // Cably Desktop, based on KiCad
 
     // JPC: A very ugly hack to fix an issue on Linux: if the wxbase315u_xml_gcc_custom.so is
     // used **only** in PCM, it is not found in some cases at run time.
@@ -268,10 +272,19 @@ KICAD_MANAGER_FRAME::KICAD_MANAGER_FRAME( wxWindow* parent, const wxString& titl
     m_auimgr.AddPane( m_notebook, EDA_PANE().Canvas().Name( "Editors" ).Center().Caption( EDITORS_CAPTION )
                                             .PaneBorder( false ).MinSize( m_notebook->GetBestSize() ) );
 
+    // Cably: the home screen is a second centre pane.  updateCablyHomeVisibility() shows it
+    // (hiding the editors notebook and the project tree) while no project is loaded, and
+    // the reverse once one is, so the tree stays reachable exactly as before.
+    m_cablyHome = new CABLY_HOME_PANEL( this );
+    m_auimgr.AddPane( m_cablyHome, EDA_PANE().Canvas().Name( "CablyHome" ).Center()
+                                             .PaneBorder( false ).Hide() );
+
     m_auimgr.Update();
 
     // Now the actual m_projectTreePane size is set, give it a reasonable min width
     m_auimgr.GetPane( m_projectTreePane ).MinSize( defaultLeftWinWidth, FromDIP( 80 ) );
+
+    updateCablyHomeVisibility();
 
 
     wxSizer* mainSizer = GetSizer();
@@ -284,10 +297,9 @@ KICAD_MANAGER_FRAME::KICAD_MANAGER_FRAME( wxWindow* parent, const wxString& titl
         Center();
     }
 
-    if( ADVANCED_CFG::GetCfg().m_HideVersionFromTitle )
-        SetTitle( wxT( "KiCad" ) );
-    else
-        SetTitle( wxString( "KiCad " ) + GetMajorMinorVersion() );
+    // Cably Desktop: the title carries the product name only. GetMajorMinorVersion() is
+    // KiCad's version and is attributed in the About dialog ("based on KiCad") instead.
+    SetTitle( wxString( CABLY_PRODUCT_NAME ) );
 
     // Do not let the messages window have initial focus
     m_projectTreePane->SetFocus();
@@ -862,6 +874,7 @@ bool KICAD_MANAGER_FRAME::CloseProject( bool aSave )
 
     m_projectTreePane->EmptyTreePrj();
     HideTabsIfNeeded();
+    updateCablyHomeVisibility();
 
     return true;
 }
@@ -1032,6 +1045,7 @@ bool KICAD_MANAGER_FRAME::LoadProject( const wxFileName& aProjectFileName )
 
     // Always start with the apps page
     m_notebook->SetSelection( 0 );
+    updateCablyHomeVisibility();
 
     // Rebuild the list of watched paths.
     // however this is possible only when the main loop event handler is running,
@@ -1206,6 +1220,9 @@ void KICAD_MANAGER_FRAME::ShowChangedLanguage()
     RecreateToolbars();
     m_launcher->CreateLaunchers();
 
+    if( m_cablyHome )
+        m_cablyHome->ShowChangedLanguage();
+
     // update captions
     int pageId = m_notebook->FindPage( m_launcher );
 
@@ -1297,10 +1314,8 @@ void KICAD_MANAGER_FRAME::ProjectChanged()
         title = _( "[no project loaded]" );
     }
 
-    if( ADVANCED_CFG::GetCfg().m_HideVersionFromTitle )
-        title += wxT( " \u2014 " ) + wxString( wxS( "KiCad" ) );
-    else
-        title += wxT( " \u2014 " ) + wxString( wxS( "KiCad " ) ) + GetMajorMinorVersion();
+    // Cably Desktop: product name only (see the constructor for why no version).
+    title += wxT( " \u2014 " ) + wxString( CABLY_PRODUCT_NAME );
 
     SetTitle( title );
 
@@ -1336,7 +1351,9 @@ void KICAD_MANAGER_FRAME::SaveSettings( APP_SETTINGS_BASE* aCfg )
 
     wxCHECK( settings, /*void*/ );
 
-    settings->m_LeftWinWidth = m_projectTreePane->GetSize().x;
+    // Cably: the tree is hidden while the home screen is up; don't persist a collapsed width.
+    if( m_projectTreePane->IsShown() )
+        settings->m_LeftWinWidth = m_projectTreePane->GetSize().x;
     settings->m_ShowHistoryPanel = m_historyPane && m_auimgr.GetPane( m_historyPane ).IsShown();
 
     if( !m_isClosing )
@@ -1354,6 +1371,23 @@ void KICAD_MANAGER_FRAME::PrintPrjInfo()
 bool KICAD_MANAGER_FRAME::IsProjectActive()
 {
     return m_active_project;
+}
+
+
+void KICAD_MANAGER_FRAME::updateCablyHomeVisibility()
+{
+    if( !m_cablyHome || m_isClosing || !m_auimgr.GetManagedWindow() )
+        return;
+
+    const bool showHome = !m_active_project;
+
+    if( showHome )
+        m_cablyHome->RefreshRecentProjects();
+
+    m_auimgr.GetPane( m_cablyHome ).Show( showHome );
+    m_auimgr.GetPane( m_notebook ).Show( !showHome );
+    m_auimgr.GetPane( m_projectTreePane ).Show( !showHome );
+    m_auimgr.Update();
 }
 
 

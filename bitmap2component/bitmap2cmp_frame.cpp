@@ -153,7 +153,7 @@ BITMAP2CMP_FRAME::BITMAP2CMP_FRAME( KIWAY* aKiway, wxWindow* aParent ) :
         m_panel( nullptr ),
         m_statusBar( nullptr )
 {
-    m_aboutTitle = _HKI( "KiCad Image Converter" );
+    m_aboutTitle = _HKI( "Cably Image Converter" ); // Cably Desktop, based on KiCad
 
     // Give an icon
     wxIcon icon;

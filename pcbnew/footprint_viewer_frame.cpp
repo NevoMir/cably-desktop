@@ -108,7 +108,7 @@ FOOTPRINT_VIEWER_FRAME::FOOTPRINT_VIEWER_FRAME( KIWAY* aKiway, wxWindow* aParent
                     FOOTPRINT_VIEWER_FRAME_NAME ),
    m_comp( LIB_ID(), wxEmptyString, wxEmptyString, KIID_PATH(), {} )
 {
-    m_aboutTitle = _HKI( "KiCad Footprint Library Browser" );
+    m_aboutTitle = _HKI( "Cably Footprint Library Browser" ); // Cably Desktop, based on KiCad
 
     // Force the items to always snap
     m_magneticItems.pads     = MAGNETIC_OPTIONS::CAPTURE_ALWAYS;

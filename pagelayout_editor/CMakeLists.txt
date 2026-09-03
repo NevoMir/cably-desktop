@@ -1,3 +1,25 @@
+#
+#  This program source code file is part of KiCad, a free EDA CAD application,
+#  as modified for Cably Desktop (based on KiCad); modifications are listed in
+#  CHANGES.md as required by GPLv3 s5(a).
+#
+#  Copyright The KiCad Developers, see AUTHORS.txt for contributors.
+#  Copyright (C) 2026 Cably <dev@cably.dev> (modifications only)
+#
+#  This program is free software: you can redistribute it and/or modify
+#  it under the terms of the GNU General Public License as published by
+#  the Free Software Foundation, either version 3 of the License, or
+#  (at your option) any later version.
+#
+#  This program is distributed in the hope that it will be useful,
+#  but WITHOUT ANY WARRANTY; without even the implied warranty of
+#  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+#  GNU General Public License for more details.
+#
+#  You should have received a copy of the GNU General Public License
+#  along with this program.  If not, see <https://www.gnu.org/licenses/>.
+#
+
 # Add all the warnings to the files
 if( COMPILER_SUPPORTS_WARNINGS )
     set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} ${WARN_FLAGS_CXX}")
@@ -67,7 +89,7 @@ if( APPLE )
         MACOSX_PACKAGE_LOCATION Resources
         )
     set( MACOSX_BUNDLE_ICON_FILE pagelayout_editor.icns )
-    set( MACOSX_BUNDLE_GUI_IDENTIFIER org.kicad.kicad )
+    set( MACOSX_BUNDLE_GUI_IDENTIFIER org.cably.desktop.pl-editor )   # Cably Desktop, based on KiCad
     set( MACOSX_BUNDLE_NAME pl_editor )
 endif()
 

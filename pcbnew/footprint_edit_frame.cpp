@@ -106,7 +106,7 @@ FOOTPRINT_EDIT_FRAME::FOOTPRINT_EDIT_FRAME( KIWAY* aKiway, wxWindow* aParent ) :
     m_show_layer_manager_tools( true )
 {
     m_showBorderAndTitleBlock = false;   // true to show the frame references
-    m_aboutTitle = _HKI( "KiCad Footprint Editor" );
+    m_aboutTitle = _HKI( "Cably Footprint Editor" ); // Cably Desktop, based on KiCad
     m_editorSettings = nullptr;
 
     // Give an icon

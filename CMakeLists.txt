@@ -1258,6 +1258,11 @@ if( KICAD_BUILD_I18N )
     add_subdirectory( translation )
 endif()
 
+# Cably Desktop additions enter the build through this single seam (see
+# cably/CMakeLists.txt). It must come after every KiCad target exists and before
+# the macOS signing step below, which has to stay the last install rule.
+include( cably/CMakeLists.txt )
+
 if( APPLE )
     set( KICAD_OSX_CODESIGN ON
             CACHE BOOL "Sign KiCad.app on macOS" FORCE )
