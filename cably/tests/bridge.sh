@@ -1,4 +1,21 @@
 #!/usr/bin/env bash
+# This file is part of Cably Desktop, a fork of KiCad, a free EDA CAD application.
+#
+# Copyright (C) 2026 Cably
+# Copyright (C) The KiCad Developers, see AUTHORS.txt for contributors.
+#
+# This program is free software: you can redistribute it and/or modify it
+# under the terms of the GNU General Public License as published by the
+# Free Software Foundation, either version 3 of the License, or (at your
+# option) any later version.
+#
+# This program is distributed in the hope that it will be useful, but
+# WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+# General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program.  If not, see <https://www.gnu.org/licenses/>.
 # F4 acceptance for the cloud bridge (cably/src/cably_bridge.*). Written BEFORE the
 # bridge existed. Hermetic: no real network — a python mock plays Supabase + engine on
 # 127.0.0.1, and the loopback sign-in handoff is driven with curl.
@@ -170,7 +187,7 @@ if [ "$(uname)" = Darwin ]; then
   "$CLI" "${KC[@]}" --token kc-token --refresh-token kc-refresh --email kc@example.com --expires-at 4102444800 save >"$T/kc1" 2>&1; rc=$?
   if [ $rc = 0 ]; then
     OUT=$("$CLI" "${KC[@]}" show 2>&1)
-    echo "$OUT" | grep -q "email=kc@example.com" && echo "$OUT" | grep -q "access_token=kc-token" && echo "$OUT" | grep -q "expires_at=4102444800" && ok "keychain: save -> show round-trips" || bad "keychain: show: $OUT"
+    echo "$OUT" | grep -q "email=kc@example.com" && echo "$OUT" | grep -q "access_token_len=8" && echo "$OUT" | grep -q "expires_at=4102444800" && ok "keychain: save -> show round-trips" || bad "keychain: show: $OUT"
     security find-generic-password -s "$SVC" >/dev/null 2>&1 && ok "keychain: item exists under service $SVC" || bad "keychain: item not found by security(1)"
     "$CLI" "${KC[@]}" signout >/dev/null 2>&1 && ok "keychain: signout" || bad "keychain: signout failed"
     "$CLI" "${KC[@]}" show >/dev/null 2>&1 && bad "keychain: item survived signout" || ok "keychain: item gone after signout"

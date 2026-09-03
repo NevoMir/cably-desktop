@@ -38,7 +38,7 @@
  *
  *   loopback     print port=, state=, auth_url=; wait for the handoff; print email=
  *   validate     GET /auth/v1/user (refreshes on 401); print email=
- *   refresh      POST /auth/v1/token?grant_type=refresh_token; print access_token=, expires_at=
+ *   refresh      POST /auth/v1/token?grant_type=refresh_token; print access_token_len=, expires_at=
  *   list         print the projects as JSON
  *   fetch <id>   print the project JSON
  *   open <id>    fetch -> export -> write folder; print the paths as JSON (exit 2 on conflict)
@@ -213,7 +213,7 @@ int main( int argc, char** argv )
     else if( command == "refresh" )
     {
         if( bridge.RefreshSession() )
-            std::printf( "access_token=%s\nexpires_at=%lld\n", bridge.Session().accessToken.c_str(),
+            std::printf( "access_token_len=%zu\nexpires_at=%lld\n", bridge.Session().accessToken.size(),
                          bridge.Session().expiresAt );
         else
         {
@@ -315,9 +315,9 @@ int main( int argc, char** argv )
     {
         if( bridge.HasSession() )
         {
-            std::printf( "email=%s\naccess_token=%s\nrefresh_token=%s\nexpires_at=%lld\n",
-                         bridge.Session().email.c_str(), bridge.Session().accessToken.c_str(),
-                         bridge.Session().refreshToken.c_str(), bridge.Session().expiresAt );
+            std::printf( "email=%s\naccess_token_len=%zu\nrefresh_token_len=%zu\nexpires_at=%lld\n",
+                         bridge.Session().email.c_str(), bridge.Session().accessToken.size(),
+                         bridge.Session().refreshToken.size(), bridge.Session().expiresAt );
         }
         else
         {

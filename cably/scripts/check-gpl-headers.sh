@@ -7,7 +7,7 @@ BASE="${1:-10.0.6}"
 fail=0
 while IFS= read -r f; do
   [ -f "$f" ] || continue
-  case "$f" in *.cpp|*.h|*.hpp|*.c|*.cc|*.mm|*.py|*.cmake|CMakeLists.txt) ;; *) continue ;; esac
+  case "$f" in *.cpp|*.h|*.hpp|*.c|*.cc|*.mm|*.py|*.cmake|*.sh|CMakeLists.txt) ;; *) continue ;; esac
   if ! grep -q "GNU General Public License" "$f"; then
     echo "MISSING GPL HEADER: $f"; fail=1
   fi
