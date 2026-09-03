@@ -276,7 +276,9 @@ inline wxString CablySyncClock( const wxDateTime& aWhen,
 inline wxString CablySyncStatusLine( const wxDateTime& aWhen, const wxString& aHeadline,
                                      const wxDateTime::TimeZone& aTz = wxDateTime::Local )
 {
-    wxString line = wxS( "Synced to Cably" );
+    // Narrow literal on purpose: wxS() is a wide (UTF-32 on macOS) literal, invisible to
+    // `strings`, and cably/tests/home.sh asserts the built binary carries this text.
+    wxString line = wxString::FromUTF8( "Synced to Cably" );
     wxString clock = CablySyncClock( aWhen, aTz );
 
     if( !clock.IsEmpty() )
