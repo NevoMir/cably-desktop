@@ -3,6 +3,7 @@
  *
  * Copyright (C) 2013 CERN (www.cern.ch)
  * Copyright The KiCad Developers, see AUTHORS.txt for contributors.
+ * Modified by Cably, 2026 (Cably home screen) - see CHANGES.md.
  *
  * This program is free software; you can redistribute it and/or
  * modify it under the terms of the GNU General Public License
@@ -29,6 +30,7 @@
 
 class ACTION_TOOLBAR;
 class BITMAP_BUTTON;
+class CABLY_HOME_PANEL;
 class EDA_BASE_FRAME;
 class KICAD_SETTINGS;
 class PANEL_KICAD_LAUNCHER;
@@ -244,6 +246,12 @@ private:
 
     void updatePcmButtonBadge();
 
+    /**
+     * Cably: show the home screen while no project is loaded, the project tree and the
+     * editors notebook once one is.
+     */
+    void updateCablyHomeVisibility();
+
 private:
     bool                  m_openSavedWindows;
     bool                  m_restoredFromHistory;  ///< Set after restore to mark editors dirty
@@ -255,6 +263,7 @@ private:
     LOCAL_HISTORY_PANE*   m_historyPane;
     wxAuiNotebook*        m_notebook;
     PANEL_KICAD_LAUNCHER* m_launcher;
+    CABLY_HOME_PANEL*     m_cablyHome;
     int                   m_lastToolbarIconSize;
 
     std::shared_ptr<PLUGIN_CONTENT_MANAGER> m_pcm;

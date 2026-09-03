@@ -20,6 +20,15 @@
 # every KiCad target exists; each Cably feature appends its own clearly marked block and
 # wires its sources with target_sources() so the KiCad CMake files stay untouched.
 
+# ---- F3(d) home: Cably home screen in the manager window (agent "home") ----
+target_sources( kicad PRIVATE
+    ${CMAKE_CURRENT_LIST_DIR}/src/cably_home_panel.cpp
+    ${CMAKE_CURRENT_LIST_DIR}/src/cably_home_panel.h
+    ${CMAKE_CURRENT_LIST_DIR}/src/cably_home_recent.h
+    )
+target_include_directories( kicad PRIVATE ${CMAKE_CURRENT_LIST_DIR}/src )
+# ---- end F3(d) home ----
+
 # ---- F2 identity (agent "identity") ----
 # cably/src/cably_config.h holds the product name ("Cably Desktop", based on KiCad) and the
 # GPLv3 s6 corresponding-source URL. Consumers: common/dialog_about (target common) and the
