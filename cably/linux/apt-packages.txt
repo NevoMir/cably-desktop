@@ -72,8 +72,10 @@ libbz2-dev
 libgit2-dev
 unixodbc-dev
 libsecret-1-dev
+libspnav-dev
+libpoppler-glib-dev
 
-# ngspice, IPC API (nng + protobuf), STEP/3D (OCCT 7.6)
+# ngspice, IPC API (nng + protobuf), STEP/3D (OCCT 7.6), 3D mouse (libspnav: find_package( SPNAV REQUIRED ))
 libngspice0-dev
 libnng-dev
 libprotobuf-dev
@@ -93,3 +95,4 @@ lsof
 file
 dpkg-dev
 procps
+desktop-file-utils
