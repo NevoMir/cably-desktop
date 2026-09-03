@@ -83,3 +83,17 @@ if( APPLE )
 endif()
 set_target_properties( cably-bridge-cli PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/cably )
 # ---- end F4 bridge ----
+
+# ---- F5 sync-home: sync UI in the home panel (agent "sync-home") ----
+# cably/src/cably_sync_status.h: pure helpers (import-report summariser, "Synced to Cably ·
+# 12:04 · …" status line, clock, sidecar/report paths); unit test
+# cably/tests/unit/test_cably_sync_status.cpp is built standalone by cably/tests/home.sh with
+# the nlohmann/json header from thirdparty/.  The panel reaches the sync-bridge
+# (cably/src/cably_sync.h + cably_sync.cpp, agent "sync-bridge", wired by its own block:
+# CABLY_PROJECT_WATCH, CablySyncSave, CABLY_EXPORT_SIDECAR) only through the sync-adapter
+# section at the top of cably_home_panel.cpp.
+target_sources( kicad PRIVATE
+    ${CMAKE_CURRENT_LIST_DIR}/src/cably_sync_status.h
+    )
+target_link_libraries( kicad nlohmann_json )
+# ---- end F5 sync-home ----

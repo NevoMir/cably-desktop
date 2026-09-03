@@ -24,18 +24,25 @@
 
 #include <cably_config.h>
 #include <cably_home_cloud.h>
+#include <cably_sync_status.h>
 
 #include <file_history.h>
 #include <id.h>
 #include <kicad_manager_frame.h>
 #include <kiplatform/ui.h>
+#include <notifications_manager.h>
+#include <pgm_base.h>
 #include <tool/actions.h>
 #include <tool/tool_manager.h>
 #include <tools/kicad_manager_actions.h>
 #include <widgets/ui_common.h>
 
 #include <wx/button.h>
+#include <wx/datetime.h>
+#include <wx/dialog.h>
+#include <wx/ffile.h>
 #include <wx/filename.h>
+#include <wx/filesys.h>
 #include <wx/listbox.h>
 #include <wx/msgdlg.h>
 #include <wx/scrolwin.h>
@@ -44,11 +51,13 @@
 #include <wx/stattext.h>
 #include <wx/stdpaths.h>
 #include <wx/textctrl.h>
+#include <wx/timer.h>
 #include <wx/tooltip.h>
 #include <wx/utils.h>
 
 #include <atomic>
 #include <functional>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -68,6 +77,68 @@
 // listener itself, so no loopback is destroyed under a thread blocked on it.
 // ======================================================================================
 #include <cably_bridge.h>
+
+
+// ======================================================================================
+// Sync adapter (F5) — the only place in the home panel that names the sync-bridge's types.
+//
+// cably/src/cably_sync.h (agent "sync-bridge"): CABLY_PROJECT_WATCH polls the project
+// folder on its own thread (board/schematic only; backups, locks, autosaves ignored;
+// per-path debounce; content-hash dedupe seeded from the sidecar) and calls back ON THAT
+// THREAD with the whole saved document; CablySyncSave() reads the sidecar, runs
+// CABLY_BRIDGE::ImportProject (GET row -> POST /v1/import -> PATCH row, refusing when the
+// row is newer than the sidecar's cloudUpdatedAt) and rewrites the sidecar.
+// ======================================================================================
+#include <cably_sync.h>
+
+namespace
+{
+
+using SAVE_EVENT = CABLY_SAVE_EVENT;   // kind, path, text
+
+
+/// One import's verdict plus whether the bridge lost its session on the way.
+struct SYNC_RESULT
+{
+    CABLY_SYNC_RESULT result;
+    bool              sessionGone = false;
+};
+
+
+/**
+ * "Keep my KiCad edits (overwrite cloud)": forget the version the sidecar expects so
+ * ImportProject skips its newer-than check (an empty aExpectedUpdatedAt) and the PATCH
+ * goes through; the sync that follows records the new version.
+ */
+bool syncForgetCloudVersion( const std::string& aDir, std::string& aError )
+{
+    CABLY_EXPORT_SIDECAR sidecar;
+
+    if( !CABLY_EXPORT_SIDECAR::Load( aDir, sidecar ) )
+    {
+        aError = "no readable .cably-export.json in the project folder";
+        return false;
+    }
+
+    sidecar.meta.cloudUpdatedAt.clear();
+
+    if( !sidecar.Save( aDir ) )
+    {
+        aError = "couldn't rewrite .cably-export.json in the project folder";
+        return false;
+    }
+
+    return true;
+}
+
+
+/// How often the panel re-checks which project the manager has loaded (safety net for
+/// the wxEVT_SHOW hook; a project load/close is noticed within this).
+constexpr int SYNC_POLL_MS = 1500;
+
+} // namespace
+// ---- end sync adapter ------------------------------------------------------------------
+
 
 namespace
 {
@@ -100,6 +171,7 @@ constexpr int LOGIN_TIMEOUT_MS = 10 * 60 * 1000;
 /// One WaitForSession() slice: the cancel latency.
 constexpr int LOGIN_SLICE_MS = 500;
 // ---- end bridge adapter ----------------------------------------------------------------
+
 
 
 /// Cably's palette (cably.dev src/index.css), as wxColour.  Light values: background
@@ -246,6 +318,76 @@ struct CABLY_HOME_CLOUD_STATE
 };
 
 
+/// The panel's save-to-cloud side (F5).
+struct CABLY_HOME_SYNC_STATE
+{
+    CABLY_PROJECT_WATCH watch;
+    wxString            dir;        ///< the folder being watched; empty when no Cably project is loaded
+    wxString            lastDir;    ///< the folder the last import ran for (Retry's target)
+    bool                importing = false;
+    unsigned            serial = 0;            ///< bumped per import: stale results are dropped
+    wxString            lastDetails;           ///< the full text behind "Details"
+
+    std::shared_ptr<const SAVE_EVENT>              lastEvent;   ///< the save being / last sent (Retry, overwrite)
+    std::vector<std::shared_ptr<const SAVE_EVENT>> pending;     ///< saves that landed mid-import, newest per path
+
+    std::unique_ptr<wxTimer> timer;
+
+    /// Folder -> the cloud project it was opened from in this session (for "reload").
+    std::map<wxString, CLOUD_PROJECT> opened;
+};
+
+
+/// The F4 open flow's work: fetch the project, export it through the engine, write the
+/// folder.  Runs on a worker thread under the bridge mutex.  Shared by "Open" (and its
+/// Replace) and by the F5 "Discard my edits (reload from Cably)".
+static OPEN_RESULT cloudFetchExportWrite( CABLY_HOME_CLOUD_STATE* aCloud, const CLOUD_PROJECT& aProject,
+                                          const std::string& aRootUtf8, bool aForce )
+{
+    std::lock_guard<std::mutex> lock( aCloud->bridgeMutex );
+    OPEN_RESULT                 r;
+    std::string                 projectJson;
+    std::string                 cloudUpdatedAt;
+
+    if( !aCloud->bridge.FetchProject( aProject.id, projectJson, &cloudUpdatedAt ) )
+    {
+        r.error = aCloud->bridge.LastError();
+        r.sessionGone = !aCloud->bridge.HasSession();
+        return r;
+    }
+
+    r.exported = std::make_shared<CLOUD_EXPORT>();
+
+    if( !aCloud->bridge.ExportProject( projectJson, *r.exported ) )
+    {
+        r.error = aCloud->bridge.LastError();
+        r.sessionGone = !aCloud->bridge.HasSession();
+        return r;
+    }
+
+    // F5: the sidecar records which cloud row (and which version of it) this folder
+    // came from; a save there syncs back to that row (cably_sync.h).
+    CABLY_EXPORT_META meta;
+    meta.projectId = aProject.id;
+    meta.projectName = aProject.name;
+    meta.cloudUpdatedAt = cloudUpdatedAt;
+    meta.engineVersion = r.exported->engineVersion;
+
+    // The bridge derives the folder from the name (SafeStem) and applies the
+    // never-clobber-a-KiCad-edit rule via the .cably-export.json sidecar.
+    CABLY_WRITE_RESULT w = CABLY_BRIDGE::WriteProjectFolder(
+            aRootUtf8, aProject.name, r.exported->kicadPcb,
+            r.exported->hasSch ? r.exported->kicadSch : std::string(), aForce, &meta );
+
+    r.status = cloudWriteStatus( w );
+    r.ok = r.status != CLOUD_WRITE::FAILED;
+    r.error = w.error;
+    r.dir = wxString::FromUTF8( w.dir.c_str() );
+    r.proPath = wxString::FromUTF8( w.proPath.c_str() );
+    return r;
+}
+
+
 CABLY_HOME_PANEL::CABLY_HOME_PANEL( KICAD_MANAGER_FRAME* aFrame ) :
         wxPanel( aFrame, wxID_ANY, wxDefaultPosition, wxDefaultSize, wxTAB_TRAVERSAL,
                  wxS( "CablyHomePanel" ) ),
@@ -267,6 +409,9 @@ CABLY_HOME_PANEL::CABLY_HOME_PANEL( KICAD_MANAGER_FRAME* aFrame ) :
         m_refreshProjects( nullptr ),
         m_projects( nullptr ),
         m_projectsEmpty( nullptr ),
+        m_syncStatus( nullptr ),
+        m_syncDetails( nullptr ),
+        m_syncRetry( nullptr ),
         m_recentLabel( nullptr ),
         m_open( nullptr ),
         m_recentList( nullptr ),
@@ -274,17 +419,28 @@ CABLY_HOME_PANEL::CABLY_HOME_PANEL( KICAD_MANAGER_FRAME* aFrame ) :
         m_footer( nullptr ),
         m_cloudUi( CLOUD_UI::SIGNED_OUT ),
         m_cloudStatusIsError( false ),
-        m_cloud( std::make_unique<CABLY_HOME_CLOUD_STATE>() )
+        m_syncStatusIsError( false ),
+        m_cloud( std::make_unique<CABLY_HOME_CLOUD_STATE>() ),
+        m_sync( std::make_unique<CABLY_HOME_SYNC_STATE>() )
 {
     buildUi();
     updateLabels();
     applyPalette();
     setCloudUi( CLOUD_UI::SIGNED_OUT );
+    setSyncStatus( wxEmptyString, false, false, false );
     RefreshRecentProjects();
     restoreSession();
 
     Bind( wxEVT_SYS_COLOUR_CHANGED,
           wxSysColourChangedEventHandler( CABLY_HOME_PANEL::onThemeChanged ), this );
+
+    // F5: a project load hides this pane, a close shows it again — that is the hook for
+    // starting/stopping the sync watcher; the timer catches anything the show event
+    // misses.  No manager-frame change needed.
+    Bind( wxEVT_SHOW, &CABLY_HOME_PANEL::onShow, this );
+    m_sync->timer = std::make_unique<wxTimer>( this );
+    Bind( wxEVT_TIMER, &CABLY_HOME_PANEL::onSyncTimer, this );
+    m_sync->timer->Start( SYNC_POLL_MS );
 }
 
 
@@ -292,6 +448,13 @@ CABLY_HOME_PANEL::~CABLY_HOME_PANEL()
 {
     Unbind( wxEVT_SYS_COLOUR_CHANGED,
             wxSysColourChangedEventHandler( CABLY_HOME_PANEL::onThemeChanged ), this );
+    Unbind( wxEVT_SHOW, &CABLY_HOME_PANEL::onShow, this );
+    Unbind( wxEVT_TIMER, &CABLY_HOME_PANEL::onSyncTimer, this );
+
+    if( m_sync->timer )
+        m_sync->timer->Stop();
+
+    stopSync();
 
     {
         std::lock_guard<std::mutex> lock( m_cloud->live->mutex );
@@ -371,6 +534,17 @@ void CABLY_HOME_PANEL::buildUi()
     cloudSizer->Add( m_cloudExplain, 0, wxLEFT | wxRIGHT | wxTOP, FromDIP( 16 ) );
     cloudSizer->Add( m_projects, 0, wxEXPAND | wxLEFT | wxRIGHT | wxTOP, FromDIP( 16 ) );
     cloudSizer->Add( m_projectsEmpty, 0, wxLEFT | wxRIGHT | wxTOP, FromDIP( 16 ) );
+
+    // F5: the sync line ("Synced to Cably · 12:04 · …", or the error) + Details / Retry.
+    wxBoxSizer* syncRow = new wxBoxSizer( wxHORIZONTAL );
+    m_syncStatus = new wxStaticText( m_cloudCard, wxID_ANY, wxEmptyString );
+    m_syncDetails = new wxButton( m_cloudCard, wxID_ANY, wxEmptyString );
+    m_syncRetry = new wxButton( m_cloudCard, wxID_ANY, wxEmptyString );
+    syncRow->Add( m_syncStatus, 1, wxALIGN_CENTER_VERTICAL | wxRIGHT, FromDIP( 12 ) );
+    syncRow->Add( m_syncDetails, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, FromDIP( 6 ) );
+    syncRow->Add( m_syncRetry, 0, wxALIGN_CENTER_VERTICAL );
+    cloudSizer->Add( syncRow, 0, wxEXPAND | wxLEFT | wxRIGHT | wxTOP, FromDIP( 16 ) );
+
     cloudSizer->AddSpacer( FromDIP( 16 ) );
     m_cloudCard->SetSizer( cloudSizer );
 
@@ -412,9 +586,12 @@ void CABLY_HOME_PANEL::buildUi()
     m_cloudStatus->SetFont( control );
     m_cloudExplain->SetFont( KIUI::GetInfoFont( this ) );
     m_projectsEmpty->SetFont( KIUI::GetInfoFont( this ) );
+    m_syncStatus->SetFont( KIUI::GetInfoFont( this ) );
     m_recentEmpty->SetFont( KIUI::GetInfoFont( this ) );
     m_footer->SetFont( KIUI::GetInfoFont( this ) );
 
+    m_syncDetails->Bind( wxEVT_BUTTON, &CABLY_HOME_PANEL::onSyncDetails, this );
+    m_syncRetry->Bind( wxEVT_BUTTON, &CABLY_HOME_PANEL::onSyncRetry, this );
     m_generate->Bind( wxEVT_BUTTON, &CABLY_HOME_PANEL::onGenerate, this );
     m_signIn->Bind( wxEVT_BUTTON, &CABLY_HOME_PANEL::onSignIn, this );
     m_cancelSignIn->Bind( wxEVT_BUTTON, &CABLY_HOME_PANEL::onCancelSignIn, this );
@@ -448,6 +625,10 @@ void CABLY_HOME_PANEL::updateLabels()
     m_cloudExplain->SetLabel( _( "Sign in to open the circuits you generated on cably.dev: each one exports straight into the editors here, into ~/Documents/Cably Desktop." ) );
     m_cloudExplain->Wrap( FromDIP( 600 ) );
     m_projectsEmpty->SetLabel( _( "No projects yet. Generate one above, then Refresh." ) );
+    m_syncDetails->SetLabel( _( "Details" ) );
+    m_syncDetails->SetToolTip( _( "The full report of the last sync to Cably" ) );
+    m_syncRetry->SetLabel( _( "Retry" ) );
+    m_syncRetry->SetToolTip( _( "Send the last KiCad save to Cably again" ) );
 
     m_recentLabel->SetLabel( _( "Recent projects" ) );
     m_open->SetLabel( _( "Open project..." ) );
@@ -476,6 +657,7 @@ void CABLY_HOME_PANEL::applyPalette()
     m_cloudStatus->SetForegroundColour( m_cloudStatusIsError ? p.destructive : p.foreground );
     m_cloudExplain->SetForegroundColour( p.muted );
     m_projectsEmpty->SetForegroundColour( p.muted );
+    m_syncStatus->SetForegroundColour( m_syncStatusIsError ? p.destructive : p.muted );
     m_recentLabel->SetForegroundColour( p.foreground );
     m_recentList->SetBackgroundColour( p.card );
     m_recentList->SetForegroundColour( p.foreground );
@@ -816,38 +998,7 @@ void CABLY_HOME_PANEL::openProject( size_t aIndex )
             m_cloud->live, this,
             [cloud, project, rootUtf8]()
             {
-                std::lock_guard<std::mutex> lock( cloud->bridgeMutex );
-                OPEN_RESULT                 r;
-                std::string                 projectJson;
-
-                if( !cloud->bridge.FetchProject( project.id, projectJson ) )
-                {
-                    r.error = cloud->bridge.LastError();
-                    r.sessionGone = !cloud->bridge.HasSession();
-                    return r;
-                }
-
-                r.exported = std::make_shared<CLOUD_EXPORT>();
-
-                if( !cloud->bridge.ExportProject( projectJson, *r.exported ) )
-                {
-                    r.error = cloud->bridge.LastError();
-                    r.sessionGone = !cloud->bridge.HasSession();
-                    return r;
-                }
-
-                // The bridge derives the folder from the name (SafeStem) and applies the
-                // never-clobber-a-KiCad-edit rule via the .cably-export.json sidecar.
-                CABLY_WRITE_RESULT w = CABLY_BRIDGE::WriteProjectFolder(
-                        rootUtf8, project.name, r.exported->kicadPcb,
-                        r.exported->hasSch ? r.exported->kicadSch : std::string(), false );
-
-                r.status = cloudWriteStatus( w );
-                r.ok = r.status != CLOUD_WRITE::FAILED;
-                r.error = w.error;
-                r.dir = wxString::FromUTF8( w.dir.c_str() );
-                r.proPath = wxString::FromUTF8( w.proPath.c_str() );
-                return r;
+                return cloudFetchExportWrite( cloud, project, rootUtf8, false );
             },
             [this, serial, name, project, rootUtf8]( const OPEN_RESULT& aResult )
             {
@@ -855,6 +1006,13 @@ void CABLY_HOME_PANEL::openProject( size_t aIndex )
                     return;
 
                 setProjectsBusy( false );
+
+                // F5: remember which cloud project this folder is, so a save there can
+                // be reloaded from Cably without a second lookup.
+                auto remember = [this, project]( const wxString& aProPath )
+                {
+                    m_sync->opened[wxFileName( aProPath ).GetPath()] = project;
+                };
 
                 if( aResult.sessionGone )
                 {
@@ -872,6 +1030,7 @@ void CABLY_HOME_PANEL::openProject( size_t aIndex )
 
                 if( aResult.status == CLOUD_WRITE::WRITTEN )
                 {
+                    remember( aResult.proPath );
                     finishOpen( aResult.proPath );
                     return;
                 }
@@ -890,6 +1049,7 @@ void CABLY_HOME_PANEL::openProject( size_t aIndex )
 
                 if( answer == wxID_NO )
                 {
+                    remember( aResult.proPath );
                     finishOpen( aResult.proPath );
                     return;
                 }
@@ -921,7 +1081,7 @@ void CABLY_HOME_PANEL::openProject( size_t aIndex )
                             r.proPath = wxString::FromUTF8( w.proPath.c_str() );
                             return r;
                         },
-                        [this, serial2, name]( const OPEN_RESULT& aReplace )
+                        [this, serial2, name, remember]( const OPEN_RESULT& aReplace )
                         {
                             if( serial2 != m_cloud->serial )
                                 return;
@@ -936,6 +1096,7 @@ void CABLY_HOME_PANEL::openProject( size_t aIndex )
                                 return;
                             }
 
+                            remember( aReplace.proPath );
                             finishOpen( aReplace.proPath );
                         } );
             } );
@@ -1136,4 +1297,434 @@ void CABLY_HOME_PANEL::onThemeChanged( wxSysColourChangedEvent& aEvent )
 {
     applyPalette();
     aEvent.Skip();
+}
+
+
+// --- sync (F5) ----------------------------------------------------------------------------
+
+void CABLY_HOME_PANEL::NotifyProjectState()
+{
+    wxString dir;
+
+    if( m_frame->IsProjectActive() )
+    {
+        const wxString pro = m_frame->GetProjectFileName();
+
+        if( !pro.IsEmpty() )
+            dir = wxFileName( pro ).GetPath();
+    }
+
+    if( dir == m_sync->dir )
+        return;
+
+    stopSync();
+
+    if( dir.IsEmpty() )
+        return;
+
+    // Only a folder the bridge exported into is a Cably project: no sidecar, no sync.
+    if( !wxFileName::FileExists( CablySidecarPath( dir ) ) )
+        return;
+
+    startSync( dir );
+}
+
+
+void CABLY_HOME_PANEL::startSync( const wxString& aProjectDir )
+{
+    std::shared_ptr<CABLY_HOME_LIVENESS> live = m_cloud->live;
+    std::string                          error;
+
+    // The watcher calls back on its own thread with the whole saved document; hand it to
+    // the UI thread under the liveness lock exactly like cablyRunAsync does.
+    const bool ok = m_sync->watch.Start(
+            std::string( aProjectDir.ToUTF8() ),
+            [live, this]( const SAVE_EVENT& aEvent )
+            {
+                std::lock_guard<std::mutex> lock( live->mutex );
+
+                if( !live->alive )
+                    return;
+
+                std::shared_ptr<const SAVE_EVENT> event = std::make_shared<const SAVE_EVENT>( aEvent );
+
+                CallAfter(
+                        [this, event]()
+                        {
+                            onProjectFileSaved( event );
+                        } );
+            },
+            CABLY_WATCH_OPTIONS(), &error );
+
+    if( !ok )
+    {
+        setSyncStatus( wxString::Format( _( "Couldn't watch %s for saves: %s" ), aProjectDir,
+                                         wxString::FromUTF8( error.c_str() ) ),
+                       true, false, false );
+        return;
+    }
+
+    m_sync->dir = aProjectDir;
+    m_sync->pending.clear();
+    setSyncStatus( wxString::Format( _( "Saves in %s sync to Cably." ), aProjectDir ), false, false, false );
+}
+
+
+void CABLY_HOME_PANEL::stopSync()
+{
+    if( m_sync->dir.IsEmpty() )
+        return;
+
+    m_sync->watch.Stop();
+    m_sync->dir.clear();
+    m_sync->pending.clear();
+}
+
+
+void CABLY_HOME_PANEL::onProjectFileSaved( std::shared_ptr<const SAVE_EVENT> aEvent )
+{
+    if( m_sync->dir.IsEmpty() || !aEvent )
+        return;   // stopped while the event was in flight
+
+    if( m_sync->importing )
+    {
+        // Queue it for after the running import; a newer save of the same file
+        // replaces the queued one (the watcher already coalesced bursts per path).
+        for( std::shared_ptr<const SAVE_EVENT>& queued : m_sync->pending )
+        {
+            if( queued->path == aEvent->path )
+            {
+                queued = aEvent;
+                return;
+            }
+        }
+
+        m_sync->pending.push_back( aEvent );
+        return;
+    }
+
+    m_sync->lastEvent = aEvent;
+    runImport( m_sync->dir, false );
+}
+
+
+void CABLY_HOME_PANEL::runImport( const wxString& aProjectDir, bool aForce )
+{
+    if( m_sync->importing || !m_sync->lastEvent )
+        return;
+
+    m_sync->importing = true;
+    m_sync->lastDir = aProjectDir;
+
+    const unsigned                    serial = ++m_sync->serial;
+    CABLY_HOME_CLOUD_STATE*           cloud = m_cloud.get();
+    const std::string                 dirUtf8( aProjectDir.ToUTF8() );
+    std::shared_ptr<const SAVE_EVENT> event = m_sync->lastEvent;
+
+    setSyncStatus( aForce ? _( "Sending your KiCad edits to Cably (overwriting the cloud version)…" )
+                          : _( "Syncing your save to Cably…" ),
+                   false, false, false );
+
+    cablyRunAsync<SYNC_RESULT>(
+            m_cloud->live, this,
+            [cloud, dirUtf8, event, aForce]()
+            {
+                std::lock_guard<std::mutex> lock( cloud->bridgeMutex );
+                SYNC_RESULT                 r;
+
+                if( !cloud->bridge.HasSession() )
+                {
+                    r.sessionGone = true;
+                    r.result.error = "not signed in";
+                    return r;
+                }
+
+                if( aForce && !syncForgetCloudVersion( dirUtf8, r.result.error ) )
+                    return r;
+
+                r.result = CablySyncSave( cloud->bridge, dirUtf8, *event );
+                r.sessionGone = !cloud->bridge.HasSession();
+                return r;
+            },
+            [this, serial, aProjectDir]( const SYNC_RESULT& aResult )
+            {
+                if( serial != m_sync->serial )
+                    return;
+
+                m_sync->importing = false;
+
+                const wxString reason = wxString::FromUTF8( aResult.result.error.c_str() );
+
+                switch( aResult.result.outcome )
+                {
+                case CABLY_SYNC_OUTCOME::SYNCED:
+                    showSyncResult( aProjectDir, wxDateTime::Now(), aResult.result.pcbReport,
+                                    aResult.result.schReport );
+                    break;
+
+                case CABLY_SYNC_OUTCOME::CLOUD_CHANGED:
+                    askCloudChanged( aProjectDir );
+                    break;
+
+                case CABLY_SYNC_OUTCOME::NOT_CABLY_PROJECT:
+                    // The sidecar names no cloud row (an export from before F5): nothing to
+                    // sync to.  Stop watching; "Open" from the projects list writes a full one.
+                    stopSync();
+                    showSyncError( aProjectDir,
+                                   _( "this folder doesn't say which Cably project it came from; open the project from the list on the home screen again" ) );
+                    break;
+
+                case CABLY_SYNC_OUTCOME::FAILED:
+                    if( aResult.sessionGone && m_cloud->signedIn )
+                        dropSession( reason );   // the bridge lost the session (dead refresh token)
+
+                    showSyncError( aProjectDir,
+                                   aResult.sessionGone ? _( "sign in on the home screen first" ) : reason );
+                    break;
+                }
+
+                if( !m_sync->importing && !m_sync->dir.IsEmpty() && !m_sync->pending.empty() )
+                {
+                    std::shared_ptr<const SAVE_EVENT> next = m_sync->pending.front();
+                    m_sync->pending.erase( m_sync->pending.begin() );
+                    m_sync->lastEvent = next;
+                    runImport( m_sync->dir, false );
+                }
+            } );
+}
+
+
+void CABLY_HOME_PANEL::showSyncResult( const wxString& aProjectDir, const wxDateTime& aWhen,
+                                       const std::string& aPcbReportJson, const std::string& aSchReportJson )
+{
+    const CABLY_SYNC_SUMMARY summary = CablySummariseImport( aPcbReportJson, aSchReportJson );
+    const wxString           line = CablySyncStatusLine( aWhen, summary.headline );
+    const wxString           details = line + wxS( "\n" ) + aProjectDir + wxS( "\n\n" ) + summary.details;
+
+    m_sync->lastDetails = details;
+    setSyncStatus( line, !summary.ok, true, false );
+
+    // The manager's non-modal notification: the line as its title, the dropped items
+    // (or the headline) under it, and "View Details" opening the full report text,
+    // written next to the sidecar (it is not a board or schematic, so the watcher
+    // ignores it).
+    wxString href;
+    {
+        const wxString reportPath = CablySyncReportPath( aProjectDir );
+        wxFFile        file( reportPath, wxS( "w" ) );
+
+        if( file.IsOpened() && file.Write( details ) )
+            href = wxFileSystem::FileNameToURL( wxFileName( reportPath ) );
+    }
+
+    wxString description = CablySyncDroppedDigest( summary );
+
+    if( description.IsEmpty() )
+    {
+        description = summary.headline.IsEmpty() ? _( "Everything in your save fits the Cably project." )
+                                                 : summary.headline;
+    }
+
+    notifyManager( line, description, href );
+}
+
+
+void CABLY_HOME_PANEL::showSyncError( const wxString& aProjectDir, const wxString& aReason )
+{
+    const wxString line = wxString::Format( _( "Couldn't sync to Cably: %s" ), aReason );
+
+    m_sync->lastDetails = line + wxS( "\n" ) + aProjectDir;
+    setSyncStatus( line, true, false, true );
+    notifyManager( _( "Couldn't sync to Cably" ),
+                   wxString::Format( _( "%s — save again to retry, or use Retry on the home screen." ), aReason ),
+                   wxEmptyString );
+}
+
+
+void CABLY_HOME_PANEL::askCloudChanged( const wxString& aProjectDir )
+{
+    setSyncStatus( _( "This project changed on cably.dev since it was opened here." ), true, false, true );
+
+    // Parented to the manager frame: this panel is hidden while the project is loaded.
+    wxMessageDialog dlg( m_frame, _( "This project changed on cably.dev since it was opened here." ),
+                         _( "Sync to Cably" ), wxYES_NO | wxCANCEL | wxICON_QUESTION | wxCENTRE );
+    dlg.SetExtendedMessage( wxString::Format(
+            _( "Keep sends your KiCad edits in %s to Cably and overwrites the cloud version. "
+               "Discard closes the project here, fetches Cably's version and replaces the board and schematic with it." ),
+            aProjectDir ) );
+    dlg.SetYesNoCancelLabels( _( "Keep my KiCad edits (overwrite cloud)" ),
+                              _( "Discard my edits (reload from Cably)" ), _( "Cancel" ) );
+
+    const int answer = dlg.ShowModal();
+
+    if( answer == wxID_YES )
+    {
+        runImport( aProjectDir, true );   // forces the PATCH
+        return;
+    }
+
+    if( answer == wxID_NO )
+    {
+        reloadFromCloud( aProjectDir );
+        return;
+    }
+
+    setSyncStatus( _( "Not synced: this project changed on cably.dev since it was opened here. Save again to decide." ),
+                   true, false, true );
+}
+
+
+void CABLY_HOME_PANEL::reloadFromCloud( const wxString& aProjectDir )
+{
+    // Which cloud project?  The one this folder was opened from in this session, else the
+    // listed project whose folder stem matches the folder name.
+    CLOUD_PROJECT project;
+    bool          found = false;
+    auto          it = m_sync->opened.find( aProjectDir );
+
+    if( it != m_sync->opened.end() )
+    {
+        project = it->second;
+        found = true;
+    }
+    else
+    {
+        const wxArrayString dirs = wxFileName::DirName( aProjectDir ).GetDirs();
+        const wxString      folder = dirs.IsEmpty() ? wxString() : dirs.Last();
+
+        for( const CLOUD_PROJECT& candidate : m_cloud->projects )
+        {
+            if( !folder.IsEmpty()
+                && CablyProjectStem( wxString::FromUTF8( candidate.name.c_str() ) ) == folder )
+            {
+                project = candidate;
+                found = true;
+                break;
+            }
+        }
+    }
+
+    if( !m_cloud->signedIn )
+    {
+        showSyncError( aProjectDir, _( "sign in on the home screen first" ) );
+        return;
+    }
+
+    if( !found )
+    {
+        showSyncError( aProjectDir,
+                       _( "couldn't tell which Cably project this folder came from; Refresh the projects list and open it from there" ) );
+        return;
+    }
+
+    stopSync();
+
+    // The editors close (asking about unsaved changes) and this panel comes back.
+    if( !m_frame->CloseProject( true ) )
+    {
+        setSyncStatus( _( "Reload from Cably cancelled: the project stayed open." ), true, false, false );
+        NotifyProjectState();
+        return;
+    }
+
+    const wxString          name = wxString::FromUTF8( project.name.c_str() );
+    const std::string       rootUtf8( cablyProjectsRoot().ToUTF8() );
+    const unsigned          serial = m_cloud->serial;
+    CABLY_HOME_CLOUD_STATE* cloud = m_cloud.get();
+
+    setProjectsBusy( true );
+    setCloudStatus( wxString::Format( _( "Reloading \"%s\" from Cably…" ), name ), false );
+    setSyncStatus( wxString::Format( _( "Replacing %s with Cably's version…" ), aProjectDir ), false, false, false );
+
+    // The F4 open flow with Replace: Cably's export overwrites the board and schematic.
+    cablyRunAsync<OPEN_RESULT>(
+            m_cloud->live, this,
+            [cloud, project, rootUtf8]()
+            {
+                return cloudFetchExportWrite( cloud, project, rootUtf8, true );
+            },
+            [this, serial, name, project]( const OPEN_RESULT& aResult )
+            {
+                if( serial != m_cloud->serial )
+                    return;
+
+                setProjectsBusy( false );
+
+                if( aResult.sessionGone )
+                {
+                    dropSession( wxString::FromUTF8( aResult.error.c_str() ) );
+                    return;
+                }
+
+                if( !aResult.ok || aResult.status != CLOUD_WRITE::WRITTEN )
+                {
+                    const wxString reason = wxString::FromUTF8( aResult.error.c_str() );
+                    setCloudStatus( wxString::Format( _( "Couldn't reload \"%s\": %s" ), name, reason ), true );
+                    setSyncStatus( wxString::Format( _( "Couldn't reload from Cably: %s" ), reason ), true, false, false );
+                    return;
+                }
+
+                m_sync->opened[wxFileName( aResult.proPath ).GetPath()] = project;
+                setSyncStatus( wxString::Format( _( "Reloaded \"%s\" from Cably." ), name ), false, false, false );
+                finishOpen( aResult.proPath );
+            } );
+}
+
+
+void CABLY_HOME_PANEL::setSyncStatus( const wxString& aText, bool aIsError, bool aShowDetails, bool aShowRetry )
+{
+    m_syncStatusIsError = aIsError;
+    m_syncStatus->SetLabel( aText );
+    m_syncStatus->Show( !aText.IsEmpty() );
+    m_syncDetails->Show( aShowDetails );
+    m_syncRetry->Show( aShowRetry );
+
+    const CABLY_PALETTE p = cablyPalette( KIPLATFORM::UI::IsDarkTheme() );
+    m_syncStatus->SetForegroundColour( aIsError ? p.destructive : p.muted );
+    m_syncStatus->Refresh();
+    Layout();
+}
+
+
+void CABLY_HOME_PANEL::notifyManager( const wxString& aTitle, const wxString& aDescription, const wxString& aHref )
+{
+    // One notification, updated in place (the status bar bell of the manager window).
+    Pgm().GetNotificationsManager().CreateOrUpdate( wxS( "cably-sync" ), aTitle, aDescription, aHref );
+}
+
+
+void CABLY_HOME_PANEL::onSyncDetails( wxCommandEvent& aEvent )
+{
+    wxDialog dlg( this, wxID_ANY, _( "Last sync to Cably" ), wxDefaultPosition, FromDIP( wxSize( 560, 420 ) ),
+                  wxDEFAULT_DIALOG_STYLE | wxRESIZE_BORDER );
+    wxBoxSizer* sizer = new wxBoxSizer( wxVERTICAL );
+    wxTextCtrl* text = new wxTextCtrl( &dlg, wxID_ANY, m_sync->lastDetails, wxDefaultPosition, wxDefaultSize,
+                                       wxTE_MULTILINE | wxTE_READONLY | wxTE_DONTWRAP );
+
+    sizer->Add( text, 1, wxEXPAND | wxALL, FromDIP( 10 ) );
+    sizer->Add( dlg.CreateButtonSizer( wxOK ), 0, wxEXPAND | wxALL, FromDIP( 10 ) );
+    dlg.SetSizer( sizer );
+    dlg.ShowModal();
+}
+
+
+void CABLY_HOME_PANEL::onSyncRetry( wxCommandEvent& aEvent )
+{
+    if( m_sync->lastDir.IsEmpty() || m_sync->importing )
+        return;
+
+    runImport( m_sync->lastDir, false );
+}
+
+
+void CABLY_HOME_PANEL::onShow( wxShowEvent& aEvent )
+{
+    NotifyProjectState();
+    aEvent.Skip();
+}
+
+
+void CABLY_HOME_PANEL::onSyncTimer( wxTimerEvent& aEvent )
+{
+    NotifyProjectState();
 }

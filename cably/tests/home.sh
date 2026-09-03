@@ -35,6 +35,11 @@
 #  F4 (home panel <-> bridge) extends (a): the binary must carry the sign-in,
 #      projects-list, waiting, conflict and generate-on-web strings, and must
 #      NOT carry the F3 placeholder "coming in the next phase" any more.
+#  F5 (sync UI) extends (a) with the save-to-cloud strings ("Synced to Cably",
+#      the cloud-changed dialog "changed on cably.dev since it was opened here" and
+#      its three answers, the error/Retry wording) and (c) with
+#      cably/src/cably_sync_status.h (report summariser, status line, clock),
+#      compiled with the nlohmann/json header from thirdparty/ like the bridge test.
 set -uo pipefail
 FORK="$(cd "$(dirname "$0")/../.." && pwd)"
 BUILD="${CABLY_BUILD_DIR:-$FORK/../build.noindex}"
@@ -51,7 +56,10 @@ BIN="$APP/Contents/MacOS/kicad"
 for s in "Describe the circuit you want" "Recent projects" "Cably Desktop" \
          "Sign in to Cably" "Your Cably projects" "Generates on cably.dev" \
          "Waiting for the browser" "Signed in as" \
-         "This project was edited here since Cably last exported it"; do
+         "This project was edited here since Cably last exported it" \
+         "Synced to Cably" "changed on cably.dev since it was opened here" \
+         "Keep my KiCad edits (overwrite cloud)" "Discard my edits (reload from Cably)" \
+         "Couldn't sync to Cably" "Retry"; do
   # grep -F without -q: with pipefail, grep -q exiting early gives strings SIGPIPE and
   # the pipeline a non-zero status even on a match (measured 2026-09-03: false FAILs).
   if strings - "$BIN" | grep -F "$s" >/dev/null; then ok "binary carries \"$s\""; else bad "binary lacks \"$s\""; fi
@@ -68,8 +76,8 @@ else echo "  skip negative control: no official KiCad at $OFFICIAL"; fi
 if [ -x "$WXCONFIG" ]; then
   T=$(mktemp -d)
   WXLIB="$("$WXCONFIG" --prefix)/lib"
-  for t in test_cably_home_recent test_cably_home_cloud; do
-    if clang++ -std=c++17 -I"$FORK/cably/src" $("$WXCONFIG" --cxxflags) \
+  for t in test_cably_home_recent test_cably_home_cloud test_cably_sync_status; do
+    if clang++ -std=c++17 -I"$FORK/cably/src" -I"$FORK/thirdparty/nlohmann_json" $("$WXCONFIG" --cxxflags) \
           "$FORK/cably/tests/unit/$t.cpp" \
           $("$WXCONFIG" --libs base) -Wl,-rpath,"$WXLIB" -o "$T/$t" 2>"$T/cc.log"; then
       if "$T/$t" >"$T/run.log" 2>&1; then ok "unit test: $(tail -1 "$T/run.log")"
