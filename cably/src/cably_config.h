@@ -27,7 +27,10 @@
  * KiCad trademark policy and by GPLv3 s5/s6 and must not be removed. The
  * product name never combines "Cably" with the KiCad mark.
  *
- * No secrets, no cloud endpoints: this header ships in the published source.
+ * No secrets: this header ships in the published source. The cloud endpoints below
+ * are public, and the Supabase "publishable" key is public by design (it is embedded in
+ * every cably.dev web bundle; access control is the user's bearer token + row-level
+ * security, never this key).
  */
 
 #ifndef CABLY_CONFIG_H
@@ -50,5 +53,21 @@
 /// Bug reports for Cably Desktop go here, never to KiCad's tracker or forum.
 /// PLACEHOLDER until F7.
 #define CABLY_BUGS_URL "https://cably.dev/desktop/issues"
+
+/// Public cloud endpoints and the public Supabase key used by the F4 cloud bridge
+/// (cably/src/cably_bridge.h). Row-level security + the user's bearer token gate every
+/// call; the publishable key only identifies the project.
+#define CABLY_SUPABASE_URL "https://bhuzwogxxeyolpadhisl.supabase.co"
+#define CABLY_SUPABASE_PUBLISHABLE_KEY "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImJodXp3b2d4eGV5b2xwYWRoaXNsIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzE0MTg3NjksImV4cCI6MjA4Njk5NDc2OX0.mSmikj6NDiog1duZ8_eAr4CECLarlREXYN_y6TWcaEE"
+#define CABLY_ENGINE_URL "https://engine.cably.dev"
+
+/// The web page that hands a signed-in session to the desktop (F4 loopback handoff).
+#define CABLY_DESKTOP_AUTH_URL "https://cably.dev/desktop/auth"
+
+/// The web app; "Generate" opens it with ?prompt=<urlencoded> (generation stays on the web).
+#define CABLY_APP_URL "https://cably.dev/app"
+
+/// macOS keychain service name under which the desktop session is stored.
+#define CABLY_KEYCHAIN_SERVICE "dev.cably.desktop"
 
 #endif // CABLY_CONFIG_H

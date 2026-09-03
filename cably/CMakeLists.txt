@@ -47,3 +47,39 @@ target_sources( kicad PRIVATE
     ${CMAKE_CURRENT_LIST_DIR}/src/cably_home_cloud.h
     )
 # ---- end F4 home-f4 ----
+
+# ---- F4 bridge: cloud bridge (agent "bridge") ----
+# cably/src/cably_bridge.{h,cpp} (pure C++17 core: loopback sign-in, Supabase + engine
+# calls, project-folder writer), cably_bridge_keychain.cpp (macOS Security.framework
+# secret store), cably_bridge_http_kicad.cpp (KICAD_CURL_EASY transport).  The core needs
+# only the nlohmann_json and picosha2 header targets; the transport needs kicommon.
+set( CABLY_BRIDGE_SRCS
+    ${CMAKE_CURRENT_LIST_DIR}/src/cably_bridge.cpp
+    ${CMAKE_CURRENT_LIST_DIR}/src/cably_bridge_keychain.cpp
+    ${CMAKE_CURRENT_LIST_DIR}/src/cably_bridge_http_kicad.cpp
+    )
+target_sources( kicad PRIVATE ${CABLY_BRIDGE_SRCS} ${CMAKE_CURRENT_LIST_DIR}/src/cably_bridge.h )
+target_link_libraries( kicad picosha2 )
+if( APPLE )
+    target_link_libraries( kicad "-framework Security" "-framework CoreFoundation" )
+endif()
+
+# Test/diagnostic CLI driven by cably/tests/bridge.sh against a mock cloud.  Not part of
+# `all` (never packaged); build with `make cably-bridge-cli` in the KiCad build dir.
+add_executable( cably-bridge-cli EXCLUDE_FROM_ALL
+    ${CMAKE_CURRENT_LIST_DIR}/src/cably_bridge_cli.cpp
+    ${CABLY_BRIDGE_SRCS}
+    )
+target_include_directories( cably-bridge-cli PRIVATE ${CMAKE_CURRENT_LIST_DIR}/src )
+target_link_libraries( cably-bridge-cli
+    kicommon
+    core
+    nlohmann_json
+    picosha2
+    ${wxWidgets_LIBRARIES}
+    )
+if( APPLE )
+    target_link_libraries( cably-bridge-cli "-framework Security" "-framework CoreFoundation" )
+endif()
+set_target_properties( cably-bridge-cli PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/cably )
+# ---- end F4 bridge ----
