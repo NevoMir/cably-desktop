@@ -43,6 +43,8 @@
 #include "aboutinfo.h"
 #include "dialog_about.h"
 
+#include <cably_config.h>   // Cably Desktop, based on KiCad
+
 
 WX_DEFINE_OBJARRAY( CONTRIBUTORS )
 
@@ -106,20 +108,47 @@ static void buildKicadAboutBanner( EDA_BASE_FRAME* aParent, ABOUT_APP_INFO& aInf
     // info/description part HTML formatted:
     wxString description;
 
-    /* short description */
+    /* short description. Cably Desktop is a GPL fork of KiCad: the attribution below
+     * is required by GPLv3 s5/s6 and by KiCad's trademark policy, and must stay. */
     description << wxT( "<p>" );
     description << wxT( "<b><u>" )
                 << _( "Description" )
                 << wxT( "</u></b>" ); // bold & underlined font for caption
 
     description << wxT( "<p>" )
-                << _( "The KiCad EDA Suite is a set of open source applications for the "
-                      "creation of electronic schematics and printed circuit boards." )
+                << _( "Cably Desktop is the desktop companion of cably.dev for editing "
+                      "electronic schematics and printed circuit boards. It is based on KiCad, "
+                      "the open source EDA suite, and is itself free software." )
                 << wxT( "</p>" );
 
     description << wxT( "</p>" );
 
-    /* websites */
+    /* product, attribution and corresponding source (GPLv3 s6) */
+    description << wxT( "<p><b><u>" )
+                << wxString( CABLY_PRODUCT_NAME )
+                << wxT( "</u></b>" ); // bold & underlined font for caption
+
+    description << wxT( "<ul>" );
+    description << wxT( "<li>" )
+                << _( "based on KiCad" )
+                << wxT( " \u2014 " )
+                << _( "Copyright" ) << wxT( " \u00a9 The KiCad Developers" )
+                << wxT( "</li>" );
+    description << wxT( "<li>" )
+                << _( "Source code (complete corresponding source) - " )
+                << HtmlHyperlink( wxString( CABLY_SOURCE_URL ) )
+                << wxT( "</li>" );
+    description << wxT( "<li>" )
+                << _( "Cably website - " )
+                << HtmlHyperlink( wxString( CABLY_WEBSITE_URL ) )
+                << wxT( "</li>" );
+    description << wxT( "<li>" )
+                << _( "Report a Cably Desktop bug - " )
+                << HtmlHyperlink( wxString( CABLY_BUGS_URL ) )
+                << wxT( "</li>" );
+    description << wxT( "</ul></p>" );
+
+    /* the project this product is based on */
     description << wxT( "<p><b><u>" )
                 << _( "KiCad on the web" )
                 << wxT( "</u></b>" ); // bold & underlined font for caption
@@ -142,29 +171,13 @@ static void buildKicadAboutBanner( EDA_BASE_FRAME* aParent, ABOUT_APP_INFO& aInf
 
     description << wxT( "</ul></p>" );
 
-    description << wxT( "<p><b><u>" )
-                << _( "Bug tracker" )
-                << wxT( "</u></b>" ); // bold & underlined font caption
-
-    // bullet-ed list with some http links
-    description << wxT( "<ul>" );
-    description << wxT( "<li>" )
-                << _( "Report or examine bugs - " )
-                << HtmlHyperlink( wxS( "https://go.kicad.org/bugs" ) )
-                << wxT( "</li>" );
-    description << wxT( "</ul></p>" );
-
-    description << wxT( "<p><b><u>" )
-                << _( "KiCad users group and community" )
-                << wxT( "</u></b>" ); // bold & underlined font caption
-
-    description << wxT( "<ul>" );
-    description << wxT( "<li>" )
-                << _( "KiCad forum - " )
-                << HtmlHyperlink( wxS( "https://go.kicad.org/forum" ) )
-                << wxT( "</li>" );
-
-    description << wxT( "</ul></p>" );
+    // KiCad's bug tracker and forum are deliberately NOT linked: issues with this
+    // product belong to Cably, not to the KiCad project.
+    description << wxT( "<p>" )
+                << _( "KiCad is a registered trademark of LF Projects, LLC. Cably Desktop is not "
+                      "endorsed by or affiliated with the KiCad project; please do not report "
+                      "Cably Desktop issues to the KiCad bug tracker or forum." )
+                << wxT( "</p>" );
 
     aInfo.SetDescription( description );
 
@@ -174,9 +187,16 @@ static void buildKicadAboutBanner( EDA_BASE_FRAME* aParent, ABOUT_APP_INFO& aInf
     license
         << wxT( "<div align='center'>" )
         << HtmlNewline( 4 )
-        << _( "The complete KiCad EDA Suite is released under the" ) << HtmlNewline( 2 )
+        << _( "Cably Desktop, like the KiCad EDA Suite it is based on, is released under the" )
+        << HtmlNewline( 2 )
         << HtmlHyperlink( wxS( "http://www.gnu.org/licenses" ),
                           _( "GNU General Public License (GPL) version 3 or any later version" ) )
+        << HtmlNewline( 2 )
+        << _( "Complete corresponding source code:" ) << wxT( " " )
+        << HtmlHyperlink( wxString( CABLY_SOURCE_URL ) )
+        << HtmlNewline( 2 )
+        << _( "Copyright" ) << wxT( " \u00a9 The KiCad Developers, see AUTHORS.txt. " )
+        << _( "Modifications" ) << wxT( " \u00a9 Cably, recorded in CHANGES.md." )
         << wxT( "</div>" );
 
     aInfo.SetLicense( license );
