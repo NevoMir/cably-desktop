@@ -48,8 +48,11 @@ CABLY_HTTP_RESPONSE CABLY_HTTP_KICAD::Perform( const CABLY_HTTP_REQUEST& aReques
         for( const auto& h : aRequest.headers )
             curl.SetHeader( h.first, h.second );
 
-        if( aRequest.method == "POST" )
+        if( aRequest.method == "POST" || aRequest.method == "PATCH" )
             curl.SetPostFields( aRequest.body ); // sets CURLOPT_COPYPOSTFIELDS => POST
+
+        if( aRequest.method == "PATCH" ) // F5: PostgREST row update; a POST on the wire otherwise
+            curl_easy_setopt( curl.GetCurl(), CURLOPT_CUSTOMREQUEST, "PATCH" );
 
         int code = curl.Perform();
 

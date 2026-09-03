@@ -32,6 +32,15 @@
 #      page with the self-POST script, rejects a wrong state, accepts the right one
 #      exactly once, then stops listening.
 #  (e) macOS keychain store round-trip on a throw-away service name.
+#  (f) F5 sync (cably/src/cably_sync.*): the unit test cably/tests/unit/test_cably_sync.cpp
+#      builds standalone and passes; against the mock, with the REAL watcher on a real
+#      folder: an in-place save and a write-temp-then-rename save each produce exactly one
+#      POST /v1/import + one PATCH /rest/v1/projects (data.project replaced, chat kept);
+#      backup/lock/autosave writes produce nothing; our own hand-off write (Expect) is not
+#      a save; after the cloud changed (row updated_at newer than the sidecar's) the save
+#      is reported cloud-changed with NO PATCH.  Prints the measured save->sync latency.
+#  (g) Mutation check: with the content dedupe removed, or the updated_at comparison
+#      inverted, the unit test must FAIL (proves the tests hold the two rules).
 set -uo pipefail
 FORK="$(cd "$(dirname "$0")/../.." && pwd)"
 BUILD="${CABLY_BUILD_DIR:-$FORK/../build.noindex}"
@@ -41,7 +50,8 @@ fail=0; ok(){ echo "  ok   $1"; }; bad(){ echo "  FAIL $1"; fail=1; }
 
 T=$(mktemp -d)
 MOCK_PID=""; CLI_PID=""
-cleanup(){ [ -n "$MOCK_PID" ] && kill "$MOCK_PID" 2>/dev/null; [ -n "$CLI_PID" ] && kill "$CLI_PID" 2>/dev/null; rm -rf "$T"; }
+WATCH_PID=""
+cleanup(){ [ -n "$MOCK_PID" ] && kill "$MOCK_PID" 2>/dev/null; [ -n "$CLI_PID" ] && kill "$CLI_PID" 2>/dev/null; [ -n "$WATCH_PID" ] && kill "$WATCH_PID" 2>/dev/null; rm -rf "$T"; }
 trap cleanup EXIT
 
 # The publishable key is public (it ships in every web bundle); read it from the header
@@ -56,6 +66,34 @@ if clang++ -std=c++17 -Wall -I"$FORK/cably/src" -I"$FORK/thirdparty/nlohmann_jso
   if "$T/test_bridge" >"$T/run.log" 2>&1; then ok "unit test: $(tail -1 "$T/run.log")"
   else bad "unit test failed:"; sed 's/^/       /' "$T/run.log" | tail -20; fi
 else bad "unit test did not compile:"; sed 's/^/       /' "$T/cc.log" | head -30; fi
+
+# (f) unit half: the sync watcher + ImportProject, standalone as well.
+SYNC_SRCS=("$FORK/cably/src/cably_bridge.cpp" "$FORK/cably/src/cably_sync.cpp")
+if clang++ -std=c++17 -Wall -I"$FORK/cably/src" -I"$FORK/thirdparty/nlohmann_json" -I"$FORK/thirdparty/picosha2" \
+      "${SYNC_SRCS[@]}" "$FORK/cably/tests/unit/test_cably_sync.cpp" -o "$T/test_sync" 2>"$T/cc2.log"; then
+  if "$T/test_sync" >"$T/run2.log" 2>&1; then ok "sync unit test: $(tail -1 "$T/run2.log") [$(grep -o 'latency: [0-9]* ms' "$T/run2.log" | head -1)]"
+  else bad "sync unit test failed:"; sed 's/^/       /' "$T/run2.log" | tail -20; fi
+else bad "sync unit test did not compile:"; sed 's/^/       /' "$T/cc2.log" | head -30; fi
+
+# (g) mutation check: each mutant must make the sync unit test FAIL.
+mutant(){ # $1 label, $2 file, $3 sed expression
+  local src="$T/mut-$(basename "$2")"; sed "$3" "$2" >"$src"
+  if cmp -s "$src" "$2"; then bad "mutant '$1': sed matched nothing (test surface moved?)"; return; fi
+  local srcs=(); local f; for f in "${SYNC_SRCS[@]}"; do if [ "$f" = "$2" ]; then srcs+=("$src"); else srcs+=("$f"); fi; done
+  if ! clang++ -std=c++17 -I"$FORK/cably/src" -I"$FORK/thirdparty/nlohmann_json" -I"$FORK/thirdparty/picosha2" \
+        "${srcs[@]}" "$FORK/cably/tests/unit/test_cably_sync.cpp" -o "$T/mut_test" 2>"$T/mut.log"; then
+    bad "mutant '$1' did not compile: $(head -3 "$T/mut.log")"; return; fi
+  if "$T/mut_test" >"$T/mut.out" 2>&1; then bad "mutant '$1' SURVIVED (tests passed with the rule broken)"
+  else ok "mutant '$1' killed: $(grep -m1 'CHECK failed' "$T/mut.out")"; fi
+}
+mutant "content dedupe removed (our own write becomes a save)" "$FORK/cably/src/cably_sync.cpp" \
+  's/if( known != m_known.end() \&\& known->second == hash )/if( false )/'
+mutant "updated_at comparison inverted (an older row counts as changed)" "$FORK/cably/src/cably_bridge.cpp" \
+  's/return row > expected;/return row < expected;/'
+mutant "cloud-changed check removed (always patches)" "$FORK/cably/src/cably_bridge.cpp" \
+  's/if( !aExpectedUpdatedAt.empty() \&\& cloudIsNewer( rowUpdatedAt, aExpectedUpdatedAt ) )/if( false )/'
+mutant "debounce ignored (fires on the first change)" "$FORK/cably/src/cably_sync.cpp" \
+  's/const auto deadline = aNow + std::chrono::milliseconds( m_options.debounceMs );/const auto deadline = aNow;/'
 
 # The keychain and KICAD_CURL_EASY adapters at least compile standalone (they need the
 # KiCad/wx include tree to link, which (b) covers).
@@ -114,7 +152,7 @@ EOF
   [ -f "$ROOT/Blinking_LED/.cably-export.json" ] && ok "open: sidecar .cably-export.json written" || bad "open: sidecar missing"
   echo "$OUT" | grep -q "\"pcbPath\": *\"$PCB\"" && ok "open: prints the written paths" || bad "open: output: $OUT"
   F=$(req 2); E=$(req 3)
-  [ "$(echo "$F" | jq_ 'd["method"]+" "+d["path"]')" = "GET /rest/v1/projects?id=eq.p1&select=data" ] && ok "open: fetch path" || bad "open: fetch: $F"
+  [ "$(echo "$F" | jq_ 'd["method"]+" "+d["path"]')" = "GET /rest/v1/projects?id=eq.p1&select=data,updated_at" ] && ok "open: fetch path (F5: with the row's version)" || bad "open: fetch: $F"
   [ "$(echo "$F" | jq_ 'd["apikey"]')" = "$APIKEY" ] && [ "$(echo "$F" | jq_ 'd["authorization"]')" = "Bearer good-token" ] && ok "open: fetch carries apikey + bearer" || bad "open: fetch headers"
   [ "$(echo "$E" | jq_ 'd["method"]+" "+d["path"]')" = "POST /v1/export" ] && ok "open: export path" || bad "open: export: $E"
   [ "$(echo "$E" | jq_ 'd["authorization"]')" = "Bearer good-token" ] && [ "$(echo "$E" | jq_ 'd["apikey"]')" = "" ] && ok "open: export carries bearer only (no apikey)" || bad "open: export headers"
@@ -196,6 +234,137 @@ if [ "$(uname)" = Darwin ]; then
     grep -q "errSecInteractionNotAllowed\|-25308" "$T/kc1" && echo "  skip keychain (locked / no UI session): $(cat "$T/kc1")" || bad "keychain: save failed: $(cat "$T/kc1")"
   fi
 fi
+
+# (f) ------------------------------------------------------------------------
+# F5 sync against the mock with the REAL watcher (cably-bridge-cli watch).
+nowms(){ python3 -c 'import time; print(int(time.time()*1000))'; }
+sha(){ python3 -c 'import hashlib,sys; print(hashlib.sha256(open(sys.argv[1],"rb").read()).hexdigest())' "$1"; }
+mockrow(){ curl -s -m 5 "$BASE/__mock/row"; }
+scfield(){ python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))[sys.argv[2]])' "$SC5" "$1"; }
+count_since(){ tail -n +"$(( $1 + 1 ))" "$LOG" | grep -c "\"method\": \"$2\", \"path\": \"$3" || true; }
+wait_line(){ # $1 file, $2 regex, $3 timeout seconds -> 0 when seen
+  local i; for i in $(seq 1 $(( $3 * 20 ))); do grep -q "$2" "$1" 2>/dev/null && return 0; sleep 0.05; done; return 1; }
+start_watch(){ # $1 out file, rest: extra args
+  local out="$1"; shift
+  "$CLI" "${COMMON[@]}" --token good-token watch "$DIR5" --debounce 300 --poll 50 --watch-timeout 20 "$@" >"$out" 2>&1 &
+  WATCH_PID=$!; disown "$WATCH_PID" 2>/dev/null
+  wait_line "$out" '^watching=' 5 || { bad "watch did not start: $(cat "$out")"; return 1; }
+}
+end_watch(){ local i; for i in $(seq 1 100); do kill -0 "$WATCH_PID" 2>/dev/null || break; sleep 0.1; done; kill "$WATCH_PID" 2>/dev/null; WATCH_PID=""; }
+import_body(){ # $1 request line -> the import body's keys + kicadPcb/kicadSch, tab-separated
+  python3 -c 'import json,sys; d=json.loads(sys.argv[1]); b=json.loads(d["body"]); print(",".join(sorted(b.keys())), b.get("apiVersion"), json.dumps(b.get("kicadPcb")), json.dumps(b.get("kicadSch")), sep="\t")' "$1"; }
+
+ROOT5="$T/root5"
+if OUT=$("$CLI" "${COMMON[@]}" --token good-token --root "$ROOT5" open p1 2>"$T/err5"); then
+  DIR5="$ROOT5/Blinking_LED"; PCB5="$DIR5/Blinking_LED.kicad_pcb"; SCH5="$DIR5/Blinking_LED.kicad_sch"; SC5="$DIR5/.cably-export.json"
+  ROWV=$(mockrow | jq_ 'd["updated_at"]')
+  [ "$(scfield projectId)" = p1 ] && [ "$(scfield projectName)" = "Blinking LED" ] && [ "$(scfield engineVersion)" = mock-1 ] && [ "$(scfield cloudUpdatedAt)" = "$ROWV" ] && [ "$(scfield engine)" = cably ] \
+    && ok "F5 open: sidecar records projectId, projectName, cloudUpdatedAt (= the row's), engineVersion" || bad "F5 open: sidecar wrong: $(cat "$SC5")"
+
+  # -- in-place save of the board -> one import + one PATCH ------------------------------
+  N0=$(nreq)
+  if start_watch "$T/w1.out"; then
+    sleep 0.3
+    T0=$(nowms); printf '(kicad_pcb (version 20240108) (generator "kicad-user")\n  (segment (start 0 0) (end 1 1) (net 1))\n)\n' >"$PCB5"
+    if wait_line "$T/w1.out" '^event ' 15; then
+      T1=$(nowms); end_watch
+      EV=$(grep '^event ' "$T/w1.out" | head -1)
+      echo "  info F5 in-place save -> synced latency: $(( T1 - T0 )) ms (debounce 300 ms, poll 50 ms, incl. 4 HTTP calls)"
+      echo "$EV" | grep -q 'kind=board ' && echo "$EV" | grep -q 'outcome=synced ' && ok "F5 in-place: event kind=board outcome=synced" || bad "F5 in-place: $EV"
+      [ "$(count_since $N0 POST /v1/import)" = 1 ] && [ "$(count_since $N0 PATCH /rest/v1/projects)" = 1 ] && ok "F5 in-place: exactly one POST /v1/import and one PATCH" || bad "F5 in-place: imports=$(count_since $N0 POST /v1/import) patches=$(count_since $N0 PATCH /rest/v1/projects)"
+      G=$(req $((N0+1))); I=$(req $((N0+2))); P=$(req $((N0+3))); V=$(req $((N0+4)))
+      [ "$(echo "$G" | jq_ 'd["method"]+" "+d["path"]')" = "GET /rest/v1/projects?id=eq.p1&select=data,updated_at" ] && [ "$(echo "$G" | jq_ 'd["apikey"]')" = "$APIKEY" ] && [ "$(echo "$G" | jq_ 'd["authorization"]')" = "Bearer good-token" ] && ok "  1: GET the row with its version (apikey + bearer)" || bad "  1: $G"
+      [ "$(echo "$I" | jq_ 'd["method"]+" "+d["path"]')" = "POST /v1/import" ] && [ "$(echo "$I" | jq_ 'd["authorization"]')" = "Bearer good-token" ] && [ "$(echo "$I" | jq_ 'd["apikey"]')" = "" ] && ok "  2: POST /v1/import with the bearer only" || bad "  2: $I"
+      IB=$(import_body "$I")
+      [ "$IB" = "$(printf 'apiVersion,kicadPcb,project\t1\t%s\tnull' "$(python3 -c 'import json,sys; print(json.dumps(open(sys.argv[1]).read()))' "$PCB5")")" ] \
+        && ok "  2: body is exactly {apiVersion:1, project, kicadPcb:<the saved file>} (no kicadSch)" || bad "  2: body: $IB"
+      [ "$(echo "$P" | jq_ 'd["method"]+" "+d["path"]')" = "PATCH /rest/v1/projects?id=eq.p1" ] && [ "$(echo "$P" | jq_ 'd["apikey"]')" = "$APIKEY" ] && [ "$(echo "$P" | jq_ 'd["authorization"]')" = "Bearer good-token" ] && ok "  3: PATCH /rest/v1/projects?id=eq.p1 (apikey + bearer)" || bad "  3: $P"
+      [ "$(echo "$P" | jq_ 'd["prefer"]')" = "return=minimal" ] && echo "$P" | jq_ 'd["content_type"]' | grep -q "application/json" && ok "  3: Prefer: return=minimal, Content-Type json" || bad "  3: headers: $(echo "$P" | head -c 300)"
+      mockrow >"$T/row1.json"
+      if python3 -c '
+import json,sys
+d=json.loads(sys.argv[1]); b=json.loads(d["body"]); row=json.load(open(sys.argv[2]))
+assert list(b.keys())==["data"], list(b.keys())
+data=b["data"]
+assert data["schema"]=="cably-project-session-v2", data.get("schema")
+assert data["chat"]==[{"id":"m1","role":"user","content":"make a blinky","createdAt":1}], data["chat"]
+assert data["project"]["pcb"]["importedFrom"]=="kicad" and data["project"]["project_name"]=="Blinking LED", data["project"]
+assert row["data"]==data, "mock row != PATCH body"
+' "$P" "$T/row1.json" 2>"$T/p.err"; then ok "  3: body {data} = fetched data with ONLY .project replaced (schema + chat kept, project = the engine's)"; else bad "  3: PATCH body wrong: $(tail -1 "$T/p.err")"; fi
+      [ "$(echo "$V" | jq_ 'd["method"]+" "+d["path"]')" = "GET /rest/v1/projects?id=eq.p1&select=updated_at" ] && ok "  4: GET the trigger-stamped updated_at" || bad "  4: $V"
+      NEWV=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["updated_at"])' "$T/row1.json")
+      [ "$NEWV" != "$ROWV" ] && grep -q "updated_at=$NEWV " "$T/w1.out" && ok "F5 in-place: the new version ($NEWV) is reported" || bad "F5 in-place: version old=$ROWV new=$NEWV out=$(grep '^event' "$T/w1.out")"
+      [ "$(scfield cloudUpdatedAt)" = "$NEWV" ] && [ "$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["files"]["Blinking_LED.kicad_pcb"])' "$SC5")" = "$(sha "$PCB5")" ] && [ "$(scfield projectId)" = p1 ] \
+        && ok "F5 in-place: sidecar now carries the new cloudUpdatedAt and the saved board's sha256" || bad "F5 in-place: sidecar not updated: $(cat "$SC5")"
+    else bad "F5 in-place: no event within 15 s: $(cat "$T/w1.out")"; end_watch; fi
+  fi
+
+  # -- atomic save (write temp, rename over) of the schematic ----------------------------
+  N1=$(nreq)
+  if start_watch "$T/w2.out"; then
+    sleep 0.3
+    T0=$(nowms); printf '(kicad_sch (version 20231120) (generator "kicad-user")\n  (symbol (lib_id "Device:R"))\n)\n' >"$DIR5/Blinking_LED.kicad_sch.tmp-save"; mv "$DIR5/Blinking_LED.kicad_sch.tmp-save" "$SCH5"
+    if wait_line "$T/w2.out" '^event ' 15; then
+      T1=$(nowms); end_watch
+      echo "  info F5 rename-over save -> synced latency: $(( T1 - T0 )) ms"
+      EV=$(grep '^event ' "$T/w2.out" | head -1)
+      echo "$EV" | grep -q 'kind=schematic ' && echo "$EV" | grep -q 'outcome=synced ' && ok "F5 rename-over: event kind=schematic outcome=synced" || bad "F5 rename-over: $EV"
+      [ "$(count_since $N1 POST /v1/import)" = 1 ] && [ "$(count_since $N1 PATCH /rest/v1/projects)" = 1 ] && ok "F5 rename-over: exactly one POST /v1/import and one PATCH" || bad "F5 rename-over: imports=$(count_since $N1 POST /v1/import) patches=$(count_since $N1 PATCH /rest/v1/projects)"
+      IB=$(import_body "$(req $((N1+2)))")
+      [ "$IB" = "$(printf 'apiVersion,kicadSch,project\t1\tnull\t%s' "$(python3 -c 'import json,sys; print(json.dumps(open(sys.argv[1]).read()))' "$SCH5")")" ] \
+        && ok "F5 rename-over: import body carries kicadSch only (the renamed-in text)" || bad "F5 rename-over: import body: $IB"
+      [ "$(sha "$SCH5")" = "$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["files"]["Blinking_LED.kicad_sch"])' "$SC5")" ] && ok "F5 rename-over: sidecar baseline updated for the schematic" || bad "F5 rename-over: sidecar sch hash stale"
+    else bad "F5 rename-over: no event within 15 s: $(cat "$T/w2.out")"; end_watch; fi
+  fi
+
+  # -- backups, locks, autosaves -> nothing ---------------------------------------------
+  N2=$(nreq)
+  "$CLI" "${COMMON[@]}" --token good-token watch "$DIR5" --debounce 200 --poll 50 --watch-timeout 3 >"$T/w3.out" 2>&1 &
+  WATCH_PID=$!; disown "$WATCH_PID" 2>/dev/null
+  if wait_line "$T/w3.out" '^watching=' 5; then
+    sleep 0.2
+    echo "old" >"$DIR5/Blinking_LED.kicad_pcb-bak"; echo "{}" >"$DIR5/~Blinking_LED.kicad_pcb.lck"; echo "(kicad_pcb auto)" >"$DIR5/_autosave-Blinking_LED.kicad_pcb"; echo "(kicad_pcb saved)" >"$DIR5/_saved_Blinking_LED.kicad_pcb"
+    mkdir -p "$DIR5/Blinking_LED-backups"; echo "(kicad_pcb backup)" >"$DIR5/Blinking_LED-backups/Blinking_LED.kicad_pcb"
+    end_watch
+    grep -q '^events=0$' "$T/w3.out" && grep -q '^exit=3$' "$T/w3.out" && ok "F5 backups/locks/autosaves: no event (watch timed out, exit 3)" || bad "F5 backups: $(cat "$T/w3.out")"
+    [ "$(nreq)" = "$N2" ] && ok "F5 backups/locks/autosaves: no HTTP call at all" || bad "F5 backups: $(( $(nreq) - N2 )) requests"
+  else bad "F5 backups: watch did not start: $(cat "$T/w3.out")"; end_watch; fi
+
+  # -- our own hand-off write (Expect) is not a save; the next real one is --------------
+  N3=$(nreq)
+  if start_watch "$T/w4.out" --once --self-write "$PCB5"; then
+    wait_line "$T/w4.out" '^self-write=done' 5 || bad "F5 self-write: not performed"
+    sleep 1.2
+    if grep -q '^event ' "$T/w4.out"; then bad "F5 self-write: our own write came back as a save: $(grep '^event' "$T/w4.out")"; else ok "F5 self-write: Expect()ed hand-off write produced no event (1.2 s)"; fi
+    [ "$(nreq)" = "$N3" ] && ok "F5 self-write: no HTTP call" || bad "F5 self-write: $(( $(nreq) - N3 )) requests"
+    printf '(kicad_pcb (version 20240108) (generator "kicad-user") edited-after-handoff)\n' >"$PCB5"
+    if wait_line "$T/w4.out" '^event ' 15; then
+      end_watch
+      IB=$(import_body "$(req $((N3+2)))")
+      case "$IB" in *edited-after-handoff*) case "$IB" in *written-by-cably*) bad "F5 self-write: import carried our own text: $IB";; *) ok "F5 self-write: the next real save is heard and carries the user's text";; esac;; *) bad "F5 self-write: import body: $IB";; esac
+      [ "$(count_since $N3 PATCH /rest/v1/projects)" = 1 ] && ok "F5 self-write: exactly one PATCH" || bad "F5 self-write: patches=$(count_since $N3 PATCH /rest/v1/projects)"
+    else bad "F5 self-write: real save not heard: $(cat "$T/w4.out")"; end_watch; fi
+  fi
+
+  # -- the cloud changed since we exported -> cloud-changed, NO PATCH --------------------
+  SCV_BEFORE=$(scfield cloudUpdatedAt)
+  TOUCHED=$(curl -s -m 5 -X POST "$BASE/__mock/touch" | jq_ 'd["updated_at"]')
+  [ "$TOUCHED" \> "$SCV_BEFORE" ] && ok "F5 cloud-changed: the row was edited elsewhere ($TOUCHED > sidecar $SCV_BEFORE)" || bad "F5 cloud-changed: touch did not bump: $TOUCHED vs $SCV_BEFORE"
+  N4=$(nreq)
+  if start_watch "$T/w5.out" --once; then
+    sleep 0.3
+    printf '(kicad_pcb (version 20240108) (generator "kicad-user") edited-while-cloud-moved)\n' >"$PCB5"
+    if wait_line "$T/w5.out" '^event ' 15; then
+      end_watch
+      EV=$(grep '^event ' "$T/w5.out" | head -1)
+      echo "$EV" | grep -q 'outcome=cloud-changed ' && echo "$EV" | grep -q "updated_at=$TOUCHED " && ok "F5 cloud-changed: event outcome=cloud-changed with the row's version" || bad "F5 cloud-changed: $EV"
+      [ "$(count_since $N4 PATCH /rest/v1/projects)" = 0 ] && [ "$(count_since $N4 POST /v1/import)" = 0 ] && ok "F5 cloud-changed: NO PATCH and no import" || bad "F5 cloud-changed: patches=$(count_since $N4 PATCH /rest/v1/projects) imports=$(count_since $N4 POST /v1/import)"
+      [ "$(( $(nreq) - N4 ))" = 1 ] && [ "$(req $((N4+1)) | jq_ 'd["method"]+" "+d["path"]')" = "GET /rest/v1/projects?id=eq.p1&select=data,updated_at" ] && ok "F5 cloud-changed: exactly one request (the GET)" || bad "F5 cloud-changed: $(( $(nreq) - N4 )) requests"
+      [ "$(scfield cloudUpdatedAt)" = "$SCV_BEFORE" ] && ok "F5 cloud-changed: sidecar untouched" || bad "F5 cloud-changed: sidecar changed"
+      if mockrow | python3 -c "import json,sys; r=json.load(sys.stdin); assert 'edited-while-cloud-moved' not in json.dumps(r) and r['data']['project']['pcb'].get('importedFrom')=='kicad'" 2>/dev/null; then ok "F5 cloud-changed: the cloud row still holds the earlier sync, not this save"; else bad "F5 cloud-changed: row clobbered"; fi
+    else bad "F5 cloud-changed: no event: $(cat "$T/w5.out")"; end_watch; fi
+  fi
+else bad "F5 open failed: $(cat "$T/err5") $OUT"; fi
 
 [ "$fail" = 0 ] && echo "bridge.sh: PASS" || echo "bridge.sh: FAIL"
 exit $fail

@@ -126,6 +126,9 @@ static std::string randomHex( size_t aBytes )
 }
 
 
+static bool cloudIsNewer( const std::string& aRowUpdatedAt, const std::string& aExpected );
+
+
 static long long nowSeconds()
 {
     return static_cast<long long>( std::time( nullptr ) );
@@ -874,7 +877,8 @@ bool CABLY_BRIDGE::RefreshSession()
 
 
 bool CABLY_BRIDGE::supabaseRequest( const std::string& aMethod, const std::string& aPath,
-                                    const std::string& aBody, CABLY_HTTP_RESPONSE& aOut )
+                                    const std::string& aBody, CABLY_HTTP_RESPONSE& aOut,
+                                    const std::vector<std::pair<std::string, std::string>>& aExtraHeaders )
 {
     if( !HasSession() )
     {
@@ -896,6 +900,9 @@ bool CABLY_BRIDGE::supabaseRequest( const std::string& aMethod, const std::strin
             req.headers.push_back( { "Content-Type", "application/json" } );
             req.body = aBody;
         }
+
+        for( const auto& h : aExtraHeaders )
+            req.headers.push_back( h );
 
         return m_http.Perform( req );
     };
@@ -1053,12 +1060,14 @@ bool CABLY_BRIDGE::ListProjects( std::vector<CABLY_PROJECT_SUMMARY>& aOut )
 }
 
 
-bool CABLY_BRIDGE::FetchProject( const std::string& aId, std::string& aProjectJson )
+bool CABLY_BRIDGE::fetchRow( const std::string& aId, bool aWithVersion, std::string& aDataJson,
+                             std::string& aUpdatedAt )
 {
     CABLY_HTTP_RESPONSE res;
+    std::string         path = "/rest/v1/projects?id=eq." + UrlEncode( aId )
+                       + ( aWithVersion ? "&select=data,updated_at" : "&select=data" );
 
-    if( !supabaseRequest( "GET", "/rest/v1/projects?id=eq." + UrlEncode( aId ) + "&select=data",
-                          "", res ) )
+    if( !supabaseRequest( "GET", path, "", res ) )
     {
         if( !res.transportOk && !res.error.empty() )
             failFrom( res, "Fetching the project" );
@@ -1079,22 +1088,8 @@ bool CABLY_BRIDGE::FetchProject( const std::string& aId, std::string& aProjectJs
             return false;
         }
 
-        const json& data = j[0]["data"];
-        const json* project = nullptr;
-
-        // PersistedProjectSession { schema, project, chat } or a legacy row that IS the project.
-        if( data.is_object() && data.contains( "project" ) && data["project"].is_object() )
-            project = &data["project"];
-        else if( data.is_object() && data.contains( "project_name" ) )
-            project = &data;
-
-        if( !project )
-        {
-            m_lastError = "Fetching the project: the row carries no project.";
-            return false;
-        }
-
-        aProjectJson = project->dump();
+        aDataJson = j[0]["data"].dump();
+        aUpdatedAt = j[0].value( "updated_at", "" );
         return true;
     }
     catch( ... )
@@ -1102,6 +1097,200 @@ bool CABLY_BRIDGE::FetchProject( const std::string& aId, std::string& aProjectJs
         m_lastError = "Fetching the project: the reply was not JSON.";
         return false;
     }
+}
+
+
+/// PersistedProjectSession { schema, project, chat } or a legacy row that IS the project.
+static const json* projectOfData( const json& aData )
+{
+    if( aData.is_object() && aData.contains( "project" ) && aData["project"].is_object() )
+        return &aData["project"];
+
+    if( aData.is_object() && aData.contains( "project_name" ) )
+        return &aData;
+
+    return nullptr;
+}
+
+
+bool CABLY_BRIDGE::FetchProject( const std::string& aId, std::string& aProjectJson,
+                                 std::string* aUpdatedAt )
+{
+    std::string dataJson, updatedAt;
+
+    if( !fetchRow( aId, aUpdatedAt != nullptr, dataJson, updatedAt ) )
+        return false;
+
+    json        data = json::parse( dataJson );
+    const json* project = projectOfData( data );
+
+    if( !project )
+    {
+        m_lastError = "Fetching the project: the row carries no project.";
+        return false;
+    }
+
+    aProjectJson = project->dump();
+
+    if( aUpdatedAt )
+        *aUpdatedAt = updatedAt;
+
+    return true;
+}
+
+
+CABLY_IMPORT_OUTCOME CABLY_BRIDGE::ImportProject( const std::string& aId, const std::string* aKicadPcb,
+                                                  const std::string* aKicadSch,
+                                                  const std::string& aExpectedUpdatedAt,
+                                                  CABLY_IMPORT_RESULT& aOut )
+{
+    aOut = CABLY_IMPORT_RESULT();
+
+    if( !aKicadPcb && !aKicadSch )
+    {
+        m_lastError = "Syncing: nothing to import (no board, no schematic).";
+        return CABLY_IMPORT_OUTCOME::FAILED;
+    }
+
+    if( !HasSession() )
+    {
+        m_lastError = "Not signed in.";
+        return CABLY_IMPORT_OUTCOME::FAILED;
+    }
+
+    // 1. the row and its version
+    std::string dataJson, rowUpdatedAt;
+
+    if( !fetchRow( aId, true, dataJson, rowUpdatedAt ) )
+        return CABLY_IMPORT_OUTCOME::FAILED;
+
+    aOut.cloudUpdatedAt = rowUpdatedAt;
+
+    // THE RULE: the cloud moved on since we exported -> never overwrite; let the UI ask.
+    // (Mutation-tested in cably/tests/bridge.sh: the inverted comparison fails the tests.)
+    if( !aExpectedUpdatedAt.empty() && cloudIsNewer( rowUpdatedAt, aExpectedUpdatedAt ) )
+    {
+        aOut.outcome = CABLY_IMPORT_OUTCOME::CLOUD_CHANGED;
+        return aOut.outcome;
+    }
+
+    json        data = json::parse( dataJson );
+    const json* project = projectOfData( data );
+
+    if( !project )
+    {
+        m_lastError = "Syncing: the row carries no project.";
+        return CABLY_IMPORT_OUTCOME::FAILED;
+    }
+
+    // 2. the engine applies the KiCad files to the project
+    json body;
+    body["apiVersion"] = 1;
+    body["project"] = *project;
+
+    if( aKicadPcb )
+        body["kicadPcb"] = *aKicadPcb;
+
+    if( aKicadSch )
+        body["kicadSch"] = *aKicadSch;
+
+    CABLY_HTTP_RESPONSE res;
+
+    if( !engineRequest( "/v1/import", body.dump(), res ) )
+    {
+        if( !res.transportOk && !res.error.empty() )
+            failFrom( res, "Cloud engine" );
+
+        return CABLY_IMPORT_OUTCOME::FAILED;
+    }
+
+    if( res.status != 200 )
+    {
+        failFrom( res, "Cloud engine" );
+        return CABLY_IMPORT_OUTCOME::FAILED;
+    }
+
+    json reply;
+
+    try
+    {
+        reply = json::parse( res.body );
+    }
+    catch( ... )
+    {
+        m_lastError = "Cloud engine: the reply was not JSON.";
+        return CABLY_IMPORT_OUTCOME::FAILED;
+    }
+
+    if( !reply.is_object() || !reply.contains( "project" ) || !reply["project"].is_object() )
+    {
+        m_lastError = "Cloud engine: the reply carried no project.";
+        return CABLY_IMPORT_OUTCOME::FAILED;
+    }
+
+    aOut.project = reply["project"].dump();
+    aOut.pcbReport = reply.contains( "pcbReport" ) ? reply["pcbReport"].dump() : "null";
+    aOut.schReport = reply.contains( "schReport" ) ? reply["schReport"].dump() : "null";
+    aOut.engineVersion = reply.value( "engineVersion", "" );
+
+    // 3. persist: ONLY data.project changes; schema and chat go back exactly as fetched
+    if( data.is_object() && data.contains( "project" ) )
+        data["project"] = reply["project"];
+    else
+        data = reply["project"]; // legacy row: the data IS the project
+
+    json patch;
+    patch["data"] = data;
+
+    if( !supabaseRequest( "PATCH", "/rest/v1/projects?id=eq." + UrlEncode( aId ), patch.dump(), res,
+                          { { "Prefer", "return=minimal" } } ) )
+    {
+        if( !res.transportOk && !res.error.empty() )
+            failFrom( res, "Saving to the cloud" );
+
+        return CABLY_IMPORT_OUTCOME::FAILED;
+    }
+
+    if( res.status != 204 && res.status != 200 )
+    {
+        failFrom( res, "Saving to the cloud" );
+        return CABLY_IMPORT_OUTCOME::FAILED;
+    }
+
+    // 4. the version the trigger stamped
+    if( !supabaseRequest( "GET", "/rest/v1/projects?id=eq." + UrlEncode( aId ) + "&select=updated_at", "", res ) )
+    {
+        if( !res.transportOk && !res.error.empty() )
+            failFrom( res, "Reading the saved version" );
+
+        return CABLY_IMPORT_OUTCOME::FAILED;
+    }
+
+    if( res.status != 200 )
+    {
+        failFrom( res, "Reading the saved version" );
+        return CABLY_IMPORT_OUTCOME::FAILED;
+    }
+
+    try
+    {
+        json j = json::parse( res.body );
+
+        if( j.is_array() && !j.empty() && j[0].is_object() )
+            aOut.updatedAt = j[0].value( "updated_at", "" );
+    }
+    catch( ... )
+    {
+    }
+
+    if( aOut.updatedAt.empty() )
+    {
+        m_lastError = "Reading the saved version: the reply carried no updated_at.";
+        return CABLY_IMPORT_OUTCOME::FAILED;
+    }
+
+    aOut.outcome = CABLY_IMPORT_OUTCOME::SYNCED;
+    return aOut.outcome;
 }
 
 
@@ -1164,6 +1353,208 @@ bool CABLY_BRIDGE::ExportProject( const std::string& aProjectJson, CABLY_EXPORT_
 }
 
 
+std::string CABLY_BRIDGE::Sha256Hex( const std::string& aText )
+{
+    return sha256Hex( aText );
+}
+
+
+/// "YYYY-MM-DDTHH:MM:SS[.frac][Z|+HH:MM|-HH:MM]" -> microseconds since the epoch, UTC.
+static bool parseIsoMicros( const std::string& aText, long long& aMicros )
+{
+    size_t p = 0;
+
+    auto digits = [&]( int aCount, long long& aOut )
+    {
+        if( p + aCount > aText.size() )
+            return false;
+
+        aOut = 0;
+
+        for( int i = 0; i < aCount; ++i )
+        {
+            char c = aText[p + i];
+
+            if( c < '0' || c > '9' )
+                return false;
+
+            aOut = aOut * 10 + ( c - '0' );
+        }
+
+        p += aCount;
+        return true;
+    };
+
+    auto expect = [&]( char aChar )
+    {
+        if( p < aText.size() && aText[p] == aChar )
+        {
+            ++p;
+            return true;
+        }
+
+        return false;
+    };
+
+    long long year, month, day, hour, minute, second;
+
+    if( !digits( 4, year ) || !expect( '-' ) || !digits( 2, month ) || !expect( '-' ) || !digits( 2, day ) )
+        return false;
+
+    if( !( expect( 'T' ) || expect( 't' ) || expect( ' ' ) ) )
+        return false;
+
+    if( !digits( 2, hour ) || !expect( ':' ) || !digits( 2, minute ) || !expect( ':' ) || !digits( 2, second ) )
+        return false;
+
+    if( month < 1 || month > 12 || day < 1 || day > 31 || hour > 23 || minute > 59 || second > 60 )
+        return false;
+
+    long long micros = 0;
+
+    if( expect( '.' ) || expect( ',' ) )
+    {
+        int  n = 0;
+        long long scale = 100000;
+
+        while( p < aText.size() && aText[p] >= '0' && aText[p] <= '9' )
+        {
+            if( n < 6 )
+                micros += ( aText[p] - '0' ) * scale;
+
+            scale /= 10;
+            ++n;
+            ++p;
+        }
+
+        if( n == 0 )
+            return false;
+    }
+
+    long long offsetMinutes = 0;
+
+    if( expect( 'Z' ) || expect( 'z' ) )
+    {
+        // UTC
+    }
+    else if( p < aText.size() && ( aText[p] == '+' || aText[p] == '-' ) )
+    {
+        int sign = aText[p] == '-' ? -1 : 1;
+        ++p;
+        long long oh, om = 0;
+
+        if( !digits( 2, oh ) )
+            return false;
+
+        if( expect( ':' ) || ( p < aText.size() && aText[p] >= '0' && aText[p] <= '9' ) )
+        {
+            if( !digits( 2, om ) )
+                return false;
+        }
+
+        offsetMinutes = sign * ( oh * 60 + om );
+    }
+
+    if( p != aText.size() )
+        return false;
+
+    // days from civil (Howard Hinnant), proleptic Gregorian
+    long long y = year - ( month <= 2 ? 1 : 0 );
+    long long era = ( y >= 0 ? y : y - 399 ) / 400;
+    long long yoe = y - era * 400;
+    long long doy = ( 153 * ( month + ( month > 2 ? -3 : 9 ) ) + 2 ) / 5 + day - 1;
+    long long doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    long long days = era * 146097 + doe - 719468;
+
+    long long seconds = days * 86400 + hour * 3600 + minute * 60 + second - offsetMinutes * 60;
+    aMicros = seconds * 1000000 + micros;
+    return true;
+}
+
+
+int CABLY_BRIDGE::CompareIsoTimestamps( const std::string& aA, const std::string& aB )
+{
+    long long a, b;
+
+    if( parseIsoMicros( aA, a ) && parseIsoMicros( aB, b ) )
+        return a < b ? -1 : ( a > b ? 1 : 0 );
+
+    int c = aA.compare( aB );
+    return c < 0 ? -1 : ( c > 0 ? 1 : 0 );
+}
+
+
+/// The cloud-changed test: newer when both stamps parse; when either does not, ANY
+/// difference counts (never overwrite on doubt).
+static bool cloudIsNewer( const std::string& aRowUpdatedAt, const std::string& aExpected )
+{
+    long long row, expected;
+
+    if( parseIsoMicros( aRowUpdatedAt, row ) && parseIsoMicros( aExpected, expected ) )
+        return row > expected;
+
+    return aRowUpdatedAt != aExpected;
+}
+
+
+bool CABLY_EXPORT_SIDECAR::Load( const std::string& aDir, CABLY_EXPORT_SIDECAR& aOut )
+{
+    std::string text;
+
+    if( !readWholeFile( fs::path( aDir ) / FileName(), text ) )
+        return false;
+
+    try
+    {
+        json j = json::parse( text );
+
+        if( !j.is_object() )
+            return false;
+
+        CABLY_EXPORT_SIDECAR sc;
+        sc.stem = j.value( "stem", "" );
+
+        if( j.contains( "files" ) && j["files"].is_object() )
+        {
+            for( auto it = j["files"].begin(); it != j["files"].end(); ++it )
+            {
+                if( it.value().is_string() )
+                    sc.files[it.key()] = it.value().get<std::string>();
+            }
+        }
+
+        sc.meta.projectId = j.value( "projectId", "" );
+        sc.meta.projectName = j.value( "projectName", "" );
+        sc.meta.cloudUpdatedAt = j.value( "cloudUpdatedAt", "" );
+        sc.meta.engineVersion = j.value( "engineVersion", "" );
+        aOut = sc;
+        return true;
+    }
+    catch( ... )
+    {
+        return false;
+    }
+}
+
+
+bool CABLY_EXPORT_SIDECAR::Save( const std::string& aDir ) const
+{
+    json j;
+    j["stem"] = stem;
+    j["files"] = json::object();
+
+    for( const auto& f : files )
+        j["files"][f.first] = f.second;
+
+    j["engine"] = "cably";
+    j["projectId"] = meta.projectId;
+    j["projectName"] = meta.projectName;
+    j["cloudUpdatedAt"] = meta.cloudUpdatedAt;
+    j["engineVersion"] = meta.engineVersion;
+    return writeWholeFile( fs::path( aDir ) / FileName(), j.dump( 2 ) + "\n" );
+}
+
+
 std::string CABLY_BRIDGE::SafeStem( const std::string& aName )
 {
     std::string out;
@@ -1208,10 +1599,9 @@ std::string CABLY_BRIDGE::SafeStem( const std::string& aName )
 
 CABLY_WRITE_RESULT CABLY_BRIDGE::WriteProjectFolder( const std::string& aRoot, const std::string& aStem,
                                                      const std::string& aPcb, const std::string& aSch,
-                                                     bool aForce )
+                                                     bool aForce, const CABLY_EXPORT_META* aMeta )
 {
     CABLY_WRITE_RESULT r;
-    const std::string  sidecarName = ".cably-export.json";
     fs::path           dir = fs::path( aRoot ) / SafeStem( aStem );
     r.dir = dir.string();
 
@@ -1224,32 +1614,19 @@ CABLY_WRITE_RESULT CABLY_BRIDGE::WriteProjectFolder( const std::string& aRoot, c
         return r;
     }
 
-    // Previous manifest: keeps the stem KiCad already knows and the baselines we wrote.
-    json        previousFiles = json::object();
-    std::string stem = SafeStem( aStem );
-    std::string sidecarText;
+    // Previous manifest: keeps the stem KiCad already knows, the baselines we wrote and
+    // (F5) the cloud row it came from.  An unreadable manifest gives no baselines: every
+    // existing file then counts as the user's.
+    CABLY_EXPORT_SIDECAR previous;
+    std::string          stem = SafeStem( aStem );
 
-    if( readWholeFile( dir / sidecarName, sidecarText ) )
-    {
-        try
-        {
-            json prev = json::parse( sidecarText );
+    if( CABLY_EXPORT_SIDECAR::Load( dir.string(), previous ) && !previous.stem.empty() )
+        stem = previous.stem;
 
-            if( prev.is_object() )
-            {
-                if( prev.contains( "stem" ) && prev["stem"].is_string()
-                    && !prev["stem"].get<std::string>().empty() )
-                    stem = prev["stem"].get<std::string>();
+    json previousFiles = json::object();
 
-                if( prev.contains( "files" ) && prev["files"].is_object() )
-                    previousFiles = prev["files"];
-            }
-        }
-        catch( ... )
-        {
-            // An unreadable manifest gives no baselines: every existing file counts as the user's.
-        }
-    }
+    for( const auto& f : previous.files )
+        previousFiles[f.first] = f.second;
 
     fs::path proPath = dir / ( stem + ".kicad_pro" );
     fs::path pcbPath = dir / ( stem + ".kicad_pcb" );
@@ -1324,14 +1701,16 @@ CABLY_WRITE_RESULT CABLY_BRIDGE::WriteProjectFolder( const std::string& aRoot, c
         }
     }
 
-    json sidecar;
-    sidecar["stem"] = stem;
-    sidecar["files"] = files;
-    sidecar["engine"] = "cably";
+    CABLY_EXPORT_SIDECAR sidecar;
+    sidecar.stem = stem;
+    sidecar.meta = aMeta ? *aMeta : previous.meta;
 
-    if( !writeWholeFile( dir / sidecarName, sidecar.dump( 2 ) + "\n" ) )
+    for( auto it = files.begin(); it != files.end(); ++it )
+        sidecar.files[it.key()] = it.value().get<std::string>();
+
+    if( !sidecar.Save( dir.string() ) )
     {
-        r.error = "Could not write " + ( dir / sidecarName ).string();
+        r.error = "Could not write " + ( dir / CABLY_EXPORT_SIDECAR::FileName() ).string();
         return r;
     }
 

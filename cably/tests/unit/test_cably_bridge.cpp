@@ -400,6 +400,16 @@ static void testListAndFetch()
     CHECK( !bridge.FetchProject( "a b", project ) );
     CHECK( http.requests[3].url == "https://supabase.test/rest/v1/projects?id=eq.a%20b&select=data" );
     CHECK( !bridge.LastError().empty() );
+
+    // F5: asking for the row's version selects it too (the sidecar records it at export).
+    http.Enqueue( 200, R"([{"data":{"schema":"cably-project-session-v2","chat":[],
+                            "project":{"project_name":"Blinking LED","schematic":{"nodes":[],"edges":[]}}},
+                            "updated_at":"2026-09-03T10:00:00.123456+00:00"}])" );
+    std::string updatedAt;
+    CHECK( bridge.FetchProject( "p1", project, &updatedAt ) );
+    CHECK( updatedAt == "2026-09-03T10:00:00.123456+00:00" );
+    CHECK( json::parse( project )["project_name"] == "Blinking LED" );
+    CHECK( http.requests[4].url == "https://supabase.test/rest/v1/projects?id=eq.p1&select=data,updated_at" );
 }
 
 
@@ -544,6 +554,51 @@ static void testWriteProjectFolder()
     r = CABLY_BRIDGE::WriteProjectFolder( root.string(), "PcbOnly", pcb1, "" );
     CHECK( r.written && r.schPath.empty() );
     CHECK( !fs::exists( root / "PcbOnly" / "PcbOnly.kicad_sch" ) );
+
+    // F5: the export records which cloud row it came from, so a later KiCad save can be
+    // synced back (projectId, projectName, cloudUpdatedAt, engineVersion in the sidecar).
+    CABLY_EXPORT_META meta;
+    meta.projectId = "p1";
+    meta.projectName = "Blinking LED!";
+    meta.cloudUpdatedAt = "2026-09-03T10:00:00.123456+00:00";
+    meta.engineVersion = "eng-1";
+    r = CABLY_BRIDGE::WriteProjectFolder( root.string(), "With Meta", pcb1, sch1, false, &meta );
+    CHECK( r.written );
+    sc = json::parse( readFile( fs::path( r.dir ) / ".cably-export.json" ) );
+    CHECK( sc["stem"] == "With_Meta" );
+    CHECK( sc["engine"] == "cably" );
+    CHECK( sc["projectId"] == "p1" );
+    CHECK( sc["projectName"] == "Blinking LED!" );
+    CHECK( sc["cloudUpdatedAt"] == "2026-09-03T10:00:00.123456+00:00" );
+    CHECK( sc["engineVersion"] == "eng-1" );
+    CHECK( sc["files"]["With_Meta.kicad_pcb"] == CABLY_BRIDGE::Sha256Hex( pcb1 ) );
+
+    // A re-export without meta keeps what the sidecar knew; with meta, it is refreshed.
+    r = CABLY_BRIDGE::WriteProjectFolder( root.string(), "With Meta", pcb2, sch1 );
+    CHECK( r.written );
+    sc = json::parse( readFile( fs::path( r.dir ) / ".cably-export.json" ) );
+    CHECK( sc["projectId"] == "p1" && sc["cloudUpdatedAt"] == "2026-09-03T10:00:00.123456+00:00" );
+    CHECK( sc["files"]["With_Meta.kicad_pcb"] == CABLY_BRIDGE::Sha256Hex( pcb2 ) );
+    meta.cloudUpdatedAt = "2026-09-03T12:00:00+00:00";
+    meta.engineVersion = "eng-2";
+    r = CABLY_BRIDGE::WriteProjectFolder( root.string(), "With Meta", pcb2, sch1, false, &meta );
+    CHECK( r.written );
+    sc = json::parse( readFile( fs::path( r.dir ) / ".cably-export.json" ) );
+    CHECK( sc["cloudUpdatedAt"] == "2026-09-03T12:00:00+00:00" && sc["engineVersion"] == "eng-2" );
+
+    // The clobber rule is unchanged by the meta: an edited board still refuses.
+    writeFile( r.pcbPath, "(kicad_pcb edited-after-meta)" );
+    r = CABLY_BRIDGE::WriteProjectFolder( root.string(), "With Meta", pcb3, sch1, false, &meta );
+    CHECK( !r.written && r.conflicts.size() == 1 );
+    CHECK( readFile( r.pcbPath ) == "(kicad_pcb edited-after-meta)" );
+
+    // The typed sidecar reader sees the same thing.
+    CABLY_EXPORT_SIDECAR typed;
+    CHECK( CABLY_EXPORT_SIDECAR::Load( r.dir, typed ) );
+    CHECK( typed.stem == "With_Meta" && typed.meta.projectId == "p1" && typed.meta.engineVersion == "eng-2" );
+    CHECK( typed.files.at( "With_Meta.kicad_sch" ) == CABLY_BRIDGE::Sha256Hex( sch1 ) );
+
+    CHECK( CABLY_BRIDGE::Sha256Hex( "" ) == "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855" );
 
     // Stems: no dots, bounded, never empty, path separators neutralised.
     CHECK( CABLY_BRIDGE::SafeStem( "My.Board v2" ) == "My_Board_v2" );

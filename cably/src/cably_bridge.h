@@ -42,6 +42,11 @@
  *
  * The exact HTTP calls (paths, headers) are documented on each method and asserted by
  * cably/tests/unit/test_cably_bridge.cpp.
+ *
+ * F5 (sync, cably_sync.h): ImportProject() sends a KiCad save back to the cloud, and the
+ * .cably-export.json sidecar (CABLY_EXPORT_SIDECAR) written next to the exported files
+ * remembers which row the folder came from and the row's version at export time, so a
+ * later save can be checked against the cloud before anything is overwritten.
  */
 
 #ifndef CABLY_BRIDGE_H
@@ -50,6 +55,7 @@
 #include <atomic>
 #include <condition_variable>
 #include <cstdint>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -256,6 +262,59 @@ struct CABLY_EXPORT_RESULT
 };
 
 
+/// F5: what the sidecar records about the cloud row an export came from.
+struct CABLY_EXPORT_META
+{
+    std::string projectId;      ///< projects.id
+    std::string projectName;    ///< projects.name at export
+    std::string cloudUpdatedAt; ///< projects.updated_at of the row we exported (or last synced)
+    std::string engineVersion;  ///< engineVersion of the export (or last import)
+};
+
+
+/**
+ * The .cably-export.json sidecar in an exported project folder:
+ *   { "stem", "files": { "<name>": "<sha256 hex>" }, "engine": "cably",
+ *     "projectId", "projectName", "cloudUpdatedAt", "engineVersion" }
+ * `files` are the baselines of the never-clobber rule (WriteProjectFolder) and of the
+ * save watcher's content dedupe (cably_sync.h); the meta fields are absent in pre-F5
+ * sidecars and then read back empty.
+ */
+struct CABLY_EXPORT_SIDECAR
+{
+    std::string                        stem;
+    std::map<std::string, std::string> files;
+    CABLY_EXPORT_META                  meta;
+
+    static const char* FileName() { return ".cably-export.json"; }
+
+    /// false when the folder has no readable, well-formed sidecar.
+    static bool Load( const std::string& aDir, CABLY_EXPORT_SIDECAR& aOut );
+    bool        Save( const std::string& aDir ) const;
+};
+
+
+/// F5: ImportProject's verdict.
+enum class CABLY_IMPORT_OUTCOME
+{
+    SYNCED,        ///< the row's data.project now holds the engine's updated project
+    CLOUD_CHANGED, ///< the row is newer than aExpectedUpdatedAt: nothing was written
+    FAILED         ///< see LastError()
+};
+
+
+struct CABLY_IMPORT_RESULT
+{
+    CABLY_IMPORT_OUTCOME outcome = CABLY_IMPORT_OUTCOME::FAILED;
+    std::string          cloudUpdatedAt; ///< the row's updated_at as fetched (set on CLOUD_CHANGED too)
+    std::string          updatedAt;      ///< the row's updated_at after the PATCH (SYNCED only)
+    std::string          project;        ///< the updated project JSON (SYNCED only)
+    std::string          pcbReport;      ///< JSON text ("null" when the engine sent none)
+    std::string          schReport;      ///< JSON text ("null" when the engine sent none)
+    std::string          engineVersion;
+};
+
+
 struct CABLY_WRITE_RESULT
 {
     bool                     written = false; ///< false => conflicts non-empty, nothing touched
@@ -315,7 +374,10 @@ public:
     bool ListProjects( std::vector<CABLY_PROJECT_SUMMARY>& aOut );
 
     /// GET {supabase}/rest/v1/projects?id=eq.<id>&select=data -> data.project as JSON text.
-    bool FetchProject( const std::string& aId, std::string& aProjectJson );
+    /// With aUpdatedAt the select becomes `data,updated_at` and the row's version is
+    /// returned too (F5: recorded in the sidecar as cloudUpdatedAt).
+    bool FetchProject( const std::string& aId, std::string& aProjectJson,
+                       std::string* aUpdatedAt = nullptr );
 
     /// POST {engine}/v1/export  headers: Authorization: Bearer, Content-Type: application/json
     /// body: {"apiVersion":1,"project":<aProjectJson>}
@@ -331,17 +393,54 @@ public:
      */
     static CABLY_WRITE_RESULT WriteProjectFolder( const std::string& aRoot, const std::string& aStem,
                                                   const std::string& aPcb, const std::string& aSch,
-                                                  bool aForce = false );
+                                                  bool aForce = false,
+                                                  const CABLY_EXPORT_META* aMeta = nullptr );
+
+    /**
+     * F5: send a KiCad save back to the cloud (mirrors the web app's F5 import path).
+     *  1. GET  {supabase}/rest/v1/projects?id=eq.<id>&select=data,updated_at
+     *     (apikey + bearer).  If aExpectedUpdatedAt is non-empty and the row's updated_at
+     *     is NEWER (CompareIsoTimestamps > 0, or unparsable and different), the cloud
+     *     changed since we exported: return CLOUD_CHANGED and touch nothing.
+     *  2. POST {engine}/v1/import  (bearer only)  body exactly
+     *     {"apiVersion":1,"project":<data.project>[,"kicadPcb":..][,"kicadSch":..]}
+     *     -> {project, pcbReport, schReport, engineVersion, timings}
+     *  3. PATCH {supabase}/rest/v1/projects?id=eq.<id>  (apikey + bearer,
+     *     Content-Type: application/json, Prefer: return=minimal)  body {"data": <data>}
+     *     where data is the fetched data with ONLY .project replaced (schema, chat kept;
+     *     a legacy row whose data IS the project gets the new project as its data).
+     *  4. GET  {supabase}/rest/v1/projects?id=eq.<id>&select=updated_at -> the version the
+     *     projects.updated_at trigger stamped (return=minimal carries none).
+     * At least one of aKicadPcb / aKicadSch must be given.  The token goes to those two
+     * hosts and nowhere else.
+     */
+    CABLY_IMPORT_OUTCOME ImportProject( const std::string& aId, const std::string* aKicadPcb,
+                                        const std::string* aKicadSch,
+                                        const std::string& aExpectedUpdatedAt,
+                                        CABLY_IMPORT_RESULT& aOut );
 
     /// [A-Za-z0-9_-] runs, no dots, max 64, never empty ("cably-project").
     static std::string SafeStem( const std::string& aName );
 
+    /// Lower-case hex SHA-256 (the sidecar's and the watcher's content hash).
+    static std::string Sha256Hex( const std::string& aText );
+
+    /**
+     * Order two ISO-8601 instants ("2026-09-03T10:00:00.123456+00:00", "...Z", "+02:00"),
+     * to the microsecond: <0, 0, >0.  When either does not parse they compare as plain
+     * strings (so a different string is never silently "equal").
+     */
+    static int CompareIsoTimestamps( const std::string& aA, const std::string& aB );
+
     const std::string& LastError() const { return m_lastError; }
 
 private:
-    /// Supabase call with apikey + bearer; one refresh-and-retry on 401.
+    /// Supabase call with apikey + bearer (+ aExtraHeaders); one refresh-and-retry on 401.
     bool supabaseRequest( const std::string& aMethod, const std::string& aPath,
-                          const std::string& aBody, CABLY_HTTP_RESPONSE& aOut );
+                          const std::string& aBody, CABLY_HTTP_RESPONSE& aOut,
+                          const std::vector<std::pair<std::string, std::string>>& aExtraHeaders = {} );
+    bool fetchRow( const std::string& aId, bool aWithVersion, std::string& aDataJson,
+                   std::string& aUpdatedAt );
     bool engineRequest( const std::string& aPath, const std::string& aBody, CABLY_HTTP_RESPONSE& aOut );
     bool failFrom( const CABLY_HTTP_RESPONSE& aResponse, const std::string& aWhat );
     void setSession( const CABLY_SESSION& aSession );

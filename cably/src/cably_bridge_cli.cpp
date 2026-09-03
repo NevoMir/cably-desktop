@@ -35,13 +35,25 @@
  *   --root DIR              where `open` writes (default ~/Documents/Cably Desktop)
  *   --timeout SECONDS       `loopback` wait (default 300)
  *   --force                 `open` overwrites edited files
+ *   --pcb FILE --sch FILE   `import`: the KiCad files to send (at least one)
+ *   --expect-updated-at T   `import`: the version we exported (empty = no cloud-changed check)
+ *   --debounce MS --poll MS `watch` (default 500 / 250)
+ *   --watch-timeout SECONDS `watch`: give up after this (default 300)
+ *   --once                  `watch`: exit after the first event
+ *   --self-write PATH       `watch`: after starting, write PATH through Expect() (must not echo)
  *
  *   loopback     print port=, state=, auth_url=; wait for the handoff; print email=
  *   validate     GET /auth/v1/user (refreshes on 401); print email=
  *   refresh      POST /auth/v1/token?grant_type=refresh_token; print access_token_len=, expires_at=
  *   list         print the projects as JSON
  *   fetch <id>   print the project JSON
- *   open <id>    fetch -> export -> write folder; print the paths as JSON (exit 2 on conflict)
+ *   open <id>    fetch -> export -> write folder (sidecar records id/name/updated_at/engine);
+ *                print the paths as JSON (exit 2 on conflict)
+ *   import <id>  F5: GET row -> POST /v1/import -> PATCH; print outcome= updated_at= ...
+ *                (exit 3 on cloud-changed)
+ *   watch <dir>  F5: watch an exported folder; every save is synced through CablySyncSave;
+ *                print watching=, one `event ...` line per save, events=, exit=
+ *                (exit 3 when the timeout passed with no event)
  *   save         store the seeded session;  show  print the stored session;  signout  clear it
  */
 
@@ -50,14 +62,19 @@
 
 #include <cably_bridge.h>
 #include <cably_config.h>
+#include <cably_sync.h>
 
 #include <nlohmann/json.hpp>
 
 #include <wx/init.h>
 
+#include <chrono>
+#include <condition_variable>
 #include <cstdio>
 #include <cstdlib>
+#include <fstream>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <vector>
 
@@ -66,8 +83,34 @@ using json = nlohmann::json;
 
 static int usage()
 {
-    std::fprintf( stderr, "usage: cably-bridge-cli [options] loopback|validate|refresh|list|fetch <id>|open <id>|save|show|signout\n" );
+    std::fprintf( stderr, "usage: cably-bridge-cli [options] loopback|validate|refresh|list|fetch <id>|open <id>|import <id>|watch <dir>|save|show|signout\n" );
     return 64;
+}
+
+
+static bool readWholeFile( const std::string& aPath, std::string& aOut )
+{
+    std::ifstream in( aPath, std::ios::binary );
+
+    if( !in )
+        return false;
+
+    aOut.assign( std::istreambuf_iterator<char>( in ), std::istreambuf_iterator<char>() );
+    return true;
+}
+
+
+static const char* outcomeName( CABLY_SYNC_OUTCOME aOutcome )
+{
+    switch( aOutcome )
+    {
+    case CABLY_SYNC_OUTCOME::SYNCED: return "synced";
+    case CABLY_SYNC_OUTCOME::CLOUD_CHANGED: return "cloud-changed";
+    case CABLY_SYNC_OUTCOME::NOT_CABLY_PROJECT: return "not-cably";
+    case CABLY_SYNC_OUTCOME::FAILED: break;
+    }
+
+    return "failed";
 }
 
 
@@ -88,6 +131,10 @@ int main( int argc, char** argv )
     bool                haveSeed = false;
     bool                force = false;
     int                 timeoutSecs = 300;
+    std::string         pcbFile, schFile, expectUpdatedAt, selfWrite;
+    CABLY_WATCH_OPTIONS watchOptions;
+    int                 watchTimeoutSecs = 300;
+    bool                once = false;
     std::vector<std::string> positional;
 
     for( int i = 1; i < argc; ++i )
@@ -117,6 +164,14 @@ int main( int argc, char** argv )
         else if( a == "--root" )            root = next();
         else if( a == "--timeout" )         timeoutSecs = std::atoi( next().c_str() );
         else if( a == "--force" )           force = true;
+        else if( a == "--pcb" )             pcbFile = next();
+        else if( a == "--sch" )             schFile = next();
+        else if( a == "--expect-updated-at" ) expectUpdatedAt = next();
+        else if( a == "--debounce" )        watchOptions.debounceMs = std::atoi( next().c_str() );
+        else if( a == "--poll" )            watchOptions.pollMs = std::atoi( next().c_str() );
+        else if( a == "--watch-timeout" )   watchTimeoutSecs = std::atoi( next().c_str() );
+        else if( a == "--once" )            once = true;
+        else if( a == "--self-write" )      selfWrite = next();
         else if( !a.empty() && a[0] == '-' ) return usage();
         else                                positional.push_back( a );
     }
@@ -246,8 +301,9 @@ int main( int argc, char** argv )
             return usage();
 
         std::string projectJson;
+        std::string cloudUpdatedAt;
 
-        if( !bridge.FetchProject( positional[1], projectJson ) )
+        if( !bridge.FetchProject( positional[1], projectJson, command == "open" ? &cloudUpdatedAt : nullptr ) )
         {
             std::fprintf( stderr, "%s\n", bridge.LastError().c_str() );
             return 1;
@@ -283,8 +339,15 @@ int main( int argc, char** argv )
             {
             }
 
+            // F5: the sidecar remembers the row and its version so a KiCad save can go back.
+            CABLY_EXPORT_META meta;
+            meta.projectId = positional[1];
+            meta.projectName = name;
+            meta.cloudUpdatedAt = cloudUpdatedAt;
+            meta.engineVersion = exported.engineVersion;
+
             CABLY_WRITE_RESULT w = CABLY_BRIDGE::WriteProjectFolder(
-                    root, name, exported.kicadPcb, exported.hasSch ? exported.kicadSch : "", force );
+                    root, name, exported.kicadPcb, exported.hasSch ? exported.kicadSch : "", force, &meta );
 
             json out;
             out["dir"] = w.dir;
@@ -292,6 +355,7 @@ int main( int argc, char** argv )
             out["pcbPath"] = w.pcbPath;
             out["schPath"] = w.schPath;
             out["engineVersion"] = exported.engineVersion;
+            out["cloudUpdatedAt"] = cloudUpdatedAt;
 
             if( !w.written )
             {
@@ -305,6 +369,120 @@ int main( int argc, char** argv )
             out["status"] = "written";
             std::printf( "%s\n", out.dump( 2 ).c_str() );
         }
+    }
+    else if( command == "import" )
+    {
+        if( positional.size() < 2 || ( pcbFile.empty() && schFile.empty() ) )
+            return usage();
+
+        std::string pcbText, schText;
+
+        if( !pcbFile.empty() && !readWholeFile( pcbFile, pcbText ) )
+        {
+            std::fprintf( stderr, "cannot read %s\n", pcbFile.c_str() );
+            return 1;
+        }
+
+        if( !schFile.empty() && !readWholeFile( schFile, schText ) )
+        {
+            std::fprintf( stderr, "cannot read %s\n", schFile.c_str() );
+            return 1;
+        }
+
+        CABLY_IMPORT_RESULT  r;
+        CABLY_IMPORT_OUTCOME outcome = bridge.ImportProject( positional[1], pcbFile.empty() ? nullptr : &pcbText,
+                                                             schFile.empty() ? nullptr : &schText,
+                                                             expectUpdatedAt, r );
+
+        if( outcome == CABLY_IMPORT_OUTCOME::SYNCED )
+        {
+            std::printf( "outcome=synced\nupdated_at=%s\nengine_version=%s\npcb_report=%s\nsch_report=%s\n",
+                         r.updatedAt.c_str(), r.engineVersion.c_str(), r.pcbReport.c_str(), r.schReport.c_str() );
+        }
+        else if( outcome == CABLY_IMPORT_OUTCOME::CLOUD_CHANGED )
+        {
+            std::printf( "outcome=cloud-changed\ncloud_updated_at=%s\n", r.cloudUpdatedAt.c_str() );
+            rc = 3;
+        }
+        else
+        {
+            std::printf( "outcome=failed\n" );
+            std::fprintf( stderr, "%s\n", bridge.LastError().c_str() );
+            rc = 1;
+        }
+    }
+    else if( command == "watch" )
+    {
+        if( positional.size() < 2 )
+            return usage();
+
+        std::mutex              mutex;
+        std::condition_variable cv;
+        int                     events = 0;
+        bool                    done = false;
+        CABLY_PROJECT_WATCH     watch;
+        std::string             err;
+
+        // The callback runs on the watcher thread; the sync is done right there (the CLI
+        // has no UI thread to marshal to) and the bridge is used from that thread only.
+        bool started = watch.Start(
+                positional[1],
+                [&]( const CABLY_SAVE_EVENT& e )
+                {
+                    CABLY_SYNC_RESULT s = CablySyncSave( bridge, positional[1], e );
+                    std::printf( "event kind=%s path=%s outcome=%s updated_at=%s engine_version=%s bytes=%zu error=%s\n",
+                                 e.kind == CABLY_SAVE_KIND::BOARD ? "board" : "schematic", e.path.c_str(),
+                                 outcomeName( s.outcome ), s.cloudUpdatedAt.c_str(), s.engineVersion.c_str(),
+                                 e.text.size(), s.error.c_str() );
+                    std::fflush( stdout );
+
+                    std::lock_guard<std::mutex> lock( mutex );
+                    ++events;
+
+                    if( once )
+                        done = true;
+
+                    cv.notify_all();
+                },
+                watchOptions, &err );
+
+        if( !started )
+        {
+            std::fprintf( stderr, "%s\n", err.c_str() );
+            return 1;
+        }
+
+        std::printf( "watching=%s debounce_ms=%d poll_ms=%d\n", positional[1].c_str(), watchOptions.debounceMs,
+                     watchOptions.pollMs );
+        std::fflush( stdout );
+
+        if( !selfWrite.empty() )
+        {
+            // What the hand-off does: announce, then write.  Must not come back as a save.
+            const std::string text = "(kicad_pcb written-by-cably-desktop)\n";
+            watch.Expect( selfWrite, text );
+            std::ofstream out( selfWrite, std::ios::binary | std::ios::trunc );
+            out << text;
+            out.close();
+            std::printf( "self-write=done\n" );
+            std::fflush( stdout );
+        }
+
+        {
+            std::unique_lock<std::mutex> lock( mutex );
+            cv.wait_for( lock, std::chrono::seconds( watchTimeoutSecs ), [&] { return done; } );
+        }
+
+        watch.Stop();
+
+        int handled;
+        {
+            std::lock_guard<std::mutex> lock( mutex );
+            handled = events;
+        }
+
+        rc = handled > 0 ? 0 : 3;
+        std::printf( "events=%d\nexit=%d\n", handled, rc );
     }
     else if( command == "save" )
     {

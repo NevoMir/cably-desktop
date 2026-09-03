@@ -97,3 +97,15 @@ target_sources( kicad PRIVATE
     )
 target_link_libraries( kicad nlohmann_json )
 # ---- end F5 sync-home ----
+
+# ---- F5 sync-bridge: KiCad save -> cloud project (agent "sync-bridge") ----
+# cably/src/cably_sync.{h,cpp}: the save watcher (polling, wx-free: see the header for the
+# measured reasons) and CablySyncSave(); CABLY_BRIDGE::ImportProject lives in the bridge.
+# Unit test cably/tests/unit/test_cably_sync.cpp is built standalone by cably/tests/bridge.sh,
+# which also drives the CLI's `watch` command against the mock cloud.
+target_sources( kicad PRIVATE
+    ${CMAKE_CURRENT_LIST_DIR}/src/cably_sync.cpp
+    ${CMAKE_CURRENT_LIST_DIR}/src/cably_sync.h
+    )
+target_sources( cably-bridge-cli PRIVATE ${CMAKE_CURRENT_LIST_DIR}/src/cably_sync.cpp )
+# ---- end F5 sync-bridge ----
