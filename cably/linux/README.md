@@ -45,13 +45,24 @@ image.
 - `run-tests.sh` prints one `ok`/`FAIL` line per check and exits 1 on any FAIL; it is red
   on an empty build volume by design. Knobs: the same plus `CABLY_FIXTURES` (default
   `cably/tests/fixtures`) and `CABLY_DEB_DIR` (default `$CABLY_BUILD_DIR/deb`).
-- `package-deb.sh` writes `cably-desktop_10.0.6+cably.<yyyymmdd>.<git rev>_<arch>.deb`
+- `package-deb.sh` writes `cably-desktop_10.0.6+cably.<yyyymmdd>.<N>.g<rev>[.dirty]_<arch>.deb`
   into `$CABLY_DEB_DIR` (default: cwd): a stripped `cmake --install` of the build under
   `/opt/cably-desktop`, launchers copied to `/usr/share/applications` with an absolute
   `Exec=`, icons/metainfo/MIME linked into `/usr/share`, `/usr/bin/cably-desktop{,-cli}`,
   `/usr/share/doc/cably-desktop/{copyright,NOTICE.md,CHANGES.md.gz}`; `Depends` come from
   `dpkg-shlibdeps` over the binaries plus `libsecret-1-0` and `python3`. Test:
   `cably/tests/deb.sh`.
+  The version: `<yyyymmdd>` is the UTC build day; `<N>` (commits since the 10.0.6 tag),
+  `<rev>` (short hash) and `.dirty` (uncommitted changes) are KiCad's `git describe --dirty`
+  as recorded in the BUILD tree (`$CABLY_BUILD_DIR/kicad_build_version.h`, the string
+  `kicad-cli version` prints), never the checkout's HEAD, so the name says what the
+  binaries are (`git describe` in the checkout is only a warned fallback for a tree without
+  the record). `N` sits before the rev because dpkg compares a hex rev as text, so a later
+  build of the same day could sort as a downgrade; `N` grows with every commit, the day
+  orders first across days, and a rebuild of the same commit keeps its version (a time of
+  day would let a later build of an older commit win). `deb.sh` checks the ordering with
+  `dpkg --compare-versions` and that the packaged `kicad-cli version --format about`
+  reports the same `<N>-g<rev>[-dirty]`.
 - `make-icons.sh` renders `cably/icons/src/*.svg` into `icons/hicolor` (the PNGs are
   committed; rerun after editing an SVG; needs `rsvg-convert`).
 - `CablyLinuxNames.cmake` is the product's desktop identity (`org.cably.desktop*`

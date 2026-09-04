@@ -19,7 +19,26 @@
 #
 # Package the built Cably Desktop as a Debian binary package for Ubuntu 24.04:
 #
-#   cably-desktop_10.0.6+cably.<yyyymmdd>.<git short rev>_<arch>.deb
+#   cably-desktop_<upstream>+cably.<yyyymmdd>.<N>.g<rev>[.dirty]_<arch>.deb
+#
+# Version scheme.  <upstream> is the KiCad tag the build descends from (10.0.6),
+# <yyyymmdd> the UTC build day, <N> the number of commits since that tag, <rev> the short
+# commit hash and .dirty present when the tree had uncommitted changes.  N, rev and
+# dirty are read from the BUILD TREE's record, $CABLY_BUILD_DIR/kicad_build_version.h
+# (KICAD_VERSION, KiCad's `git describe --dirty` at the last build - the very string the
+# binaries print as `kicad-cli version`), never from the source checkout: a checkout can
+# move on after the build, and the package name must say what the binaries are.  Only a
+# build tree without that record (a tarball build) falls back to `git describe --dirty`
+# in $CABLY_FORK, with a warning.
+#   Why a commit count and not a time of day: dpkg compares runs of digits numerically and
+# everything else as text, so with the bare hex rev after the day a later build of the
+# same day sorted as a DOWNGRADE whenever its hash happened to be smaller
+# (`dpkg --compare-versions 10.0.6+cably.20260904.1abc0000 lt 10.0.6+cably.20260904.77d2f34d53`
+# was true).  N grows with every commit, so the builds of one day order by their source;
+# across days <yyyymmdd> orders first; and a rebuild of the same commit gets the same
+# version - the version names the source, not the clock (a UTC HHMMSS would also let a
+# later build of an OLDER commit win).  .dirty sorts after the clean build of that
+# commit; a dirty build is never a release.  cably/tests/deb.sh asserts all of this.
 #
 # The tree is a fresh, STRIPPED install of the Ninja build (`cmake --install --strip`
 # under a DESTDIR) at /opt/cably-desktop - the prefix cably/linux/build.sh configures, so
@@ -61,10 +80,28 @@ for t in cmake dpkg dpkg-deb dpkg-shlibdeps file gzip; do command -v "$t" >/dev/
 mkdir -p "$OUTDIR"
 
 ARCH=$(dpkg --print-architecture)
-UPSTREAM=$(sed -n 's/^set( *KICAD_SEMANTIC_VERSION *"\([^"]*\)" *)/\1/p' "$SRC/cmake/KiCadVersion.cmake" | head -1)
-[ -n "$UPSTREAM" ] || UPSTREAM=10.0.6
-REV=$(git -C "$SRC" rev-parse --short HEAD 2>/dev/null || echo unknown)
-VERSION="${CABLY_DEB_VERSION:-$UPSTREAM+cably.$(date -u +%Y%m%d).$REV}"
+# What the build tree compiled: KICAD_VERSION in kicad_build_version.h (kicad_build_version.txt
+# is the same string), <tag>-<N>-g<rev>[-dirty].  The source checkout is only a fallback.
+RECORD=""; RECORD_FROM=""
+if [ -f "$BUILD/kicad_build_version.h" ]; then
+  RECORD=$(sed -n 's/^#define KICAD_VERSION  *"\([^"]*\)".*/\1/p' "$BUILD/kicad_build_version.h" | head -1); RECORD_FROM="$BUILD/kicad_build_version.h"
+fi
+if [ -z "$RECORD" ] && [ -f "$BUILD/kicad_build_version.txt" ]; then
+  RECORD=$(tr -d '\n\r' <"$BUILD/kicad_build_version.txt"); RECORD_FROM="$BUILD/kicad_build_version.txt"
+fi
+DESCRIBE_RE='^([0-9][0-9.]*)-([0-9]+)-g([0-9a-f]+)(-dirty)?$'
+if [[ "$RECORD" =~ $DESCRIBE_RE ]]; then
+  echo "package-deb.sh: build tree records $RECORD ($RECORD_FROM)"
+else
+  echo "package-deb.sh: WARNING: no <tag>-<N>-g<rev> record in the build tree at $BUILD (found '${RECORD:-nothing}'): falling back to git describe in $SRC - the package name is then the checkout's, not necessarily the binaries'"
+  RECORD=$(git -C "$SRC" describe --dirty 2>/dev/null || true)
+  [[ "$RECORD" =~ $DESCRIBE_RE ]] || { echo "package-deb.sh: cannot derive <tag>-<N>-g<rev> from '$RECORD' either"; exit 1; }
+fi
+UPSTREAM=${BASH_REMATCH[1]}; NCOMMITS=${BASH_REMATCH[2]}; REV=${BASH_REMATCH[3]}; DIRTY=${BASH_REMATCH[4]:+.dirty}
+SEMVER=$(sed -n 's/^set( *KICAD_SEMANTIC_VERSION *"\([^"]*\)" *)/\1/p' "$SRC/cmake/KiCadVersion.cmake" | head -1)
+[ -z "$SEMVER" ] || [ "$SEMVER" = "$UPSTREAM" ] || echo "package-deb.sh: WARNING: the build descends from tag $UPSTREAM but $SRC/cmake/KiCadVersion.cmake says $SEMVER: the checkout is not what was built"
+VERSION="${CABLY_DEB_VERSION:-$UPSTREAM+cably.$(date -u +%Y%m%d).$NCOMMITS.g$REV$DIRTY}"
+[ -z "$DIRTY" ] || echo "package-deb.sh: WARNING: the binaries were built from a tree with uncommitted changes: version marked .dirty (not a release)"
 DEB="$OUTDIR/${PKG}_${VERSION}_${ARCH}.deb"
 
 WORK=$(mktemp -d)

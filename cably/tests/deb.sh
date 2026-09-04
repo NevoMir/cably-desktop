@@ -24,7 +24,17 @@
 # "  FAIL ..."; exit 1 on any FAIL.
 #
 #  (a) static, with dpkg-deb: file name cably-desktop_<version>_<arch>.deb; control
-#      fields Package cably-desktop, Version 10.0.6+cably.<yyyymmdd>.<rev>, Architecture
+#      fields Package cably-desktop, Version 10.0.6+cably.<yyyymmdd>.<N>.g<rev>[.dirty]
+#      (N = commits since the 10.0.6 tag, rev = the short hash, .dirty = uncommitted
+#      changes: KiCad's `git describe --dirty` as recorded in the BUILD tree, see
+#      package-deb.sh) and, where dpkg exists, `dpkg --compare-versions`: a synthetic
+#      later build of the same day (N+1, rev 0000000000) sorts GREATER, the previous
+#      (N-1, rev ffffffffff) lower, a later day greater - a Version ending in the bare
+#      hex rev compared as text, so a rebuild could look like a downgrade; the
+#      <N>-g<rev>[-dirty] the packaged kicad-cli itself reports (`version --format
+#      about`, run from the extracted tree where its libraries load, i.e. in the build
+#      container, and always after the install in (b)) equals the package Version's:
+#      the name must not lie about the binaries; Architecture
 #      = this dpkg's, Maintainer Cably <dev@cably.dev>, Description first line
 #      "Cably Desktop, based on KiCad", Depends naming libsecret-1-0 and the wx/GTK
 #      runtime; contents: /opt/cably-desktop/bin/{kicad,kicad-cli}, the org.cably.desktop
@@ -57,16 +67,53 @@ MODE="${CABLY_DEB_INSTALL:-auto}"
 PKG=cably-desktop
 fail=0; ok(){ echo "  ok   $1"; }; bad(){ echo "  FAIL $1"; fail=1; }
 section(){ echo; echo "== $1"; }
+REV_CHECK_AFTER_INSTALL=0   # inner() sets 1: the packaged kicad-cli cannot run before the install there
+
+# The next build of the same day, as dpkg will see it: N+1 when the Version carries a
+# commit count, the rev 0000000000 either way (a hash may well be smaller than this one's).
+synth_later(){ # $1 Version
+  if [[ "$1" =~ ^(.*\.)([0-9]+)\.g[0-9a-f]+(\.dirty)?$ ]]; then echo "${BASH_REMATCH[1]}$(( ${BASH_REMATCH[2]} + 1 )).g0000000000"
+  else sed -E 's/[0-9a-f]{7,}$/0000000000/' <<<"$1"; fi
+}
+# What the binaries say they are (KiCad's `git describe --dirty` at build time, the
+# "Version:" line of `kicad-cli version --format about`, e.g. 10.0.6-24-g77d2f34d53[-dirty])
+# against the package Version's <N>.g<rev>[.dirty].
+rev_check(){ # $1 kicad-cli's version string  $2 the package Version  $3 which kicad-cli
+  local BV="$1" V="$2" WHERE="$3" bc="" br="" bd="" pc="" pr="" pd=""
+  if [[ "$BV" =~ ^[0-9][0-9.]*-([0-9]+)-g([0-9a-f]+)(-dirty)?$ ]]; then bc=${BASH_REMATCH[1]}; br=${BASH_REMATCH[2]}; bd=${BASH_REMATCH[3]}
+  else bad "$WHERE reports '$BV', not <tag>-<N>-g<rev>[-dirty]: cannot compare with the package Version"; return; fi
+  if [[ "$V" =~ \.([0-9]+)\.g([0-9a-f]+)(\.dirty)?$ ]]; then pc=${BASH_REMATCH[1]}; pr=${BASH_REMATCH[2]}; pd=${BASH_REMATCH[3]:+-dirty}
+  elif [[ "$V" =~ \.([0-9a-f]{7,})$ ]]; then pr=${BASH_REMATCH[1]}
+  else bad "package Version '$V' carries no rev to compare with $WHERE's $BV"; return; fi
+  if [ "$pr" = "$br" ] && [ "${pc:-$bc}" = "$bc" ] && [ "$pd" = "$bd" ]; then ok "$WHERE reports $BV = the package Version's ${pc:-?}.g$pr${pd:+.dirty}"
+  else bad "$WHERE reports $BV but the package Version says N=${pc:-?} rev $pr${pd:+ dirty}: the name lies about the binaries"; fi
+}
 
 # (a) ------------------------------------------------------------------------------
 static_checks(){ # $1 deb
   local DEB="$1" NAME; NAME=$(basename "$DEB")
   section "(a) static: $NAME ($(du -h "$DEB" | cut -f1))"
-  [[ "$NAME" =~ ^cably-desktop_10\.0\.6\+cably\.[0-9]{8}\.[0-9a-f]{7,}_(amd64|arm64)\.deb$ ]] && ok "file name matches cably-desktop_10.0.6+cably.<yyyymmdd>.<rev>_<arch>.deb" || bad "file name '$NAME' does not match ^cably-desktop_10.0.6+cably.<yyyymmdd>.<rev>_<arch>.deb$"
+  [[ "$NAME" =~ ^cably-desktop_10\.0\.6\+cably\.[0-9]{8}\.[0-9]+\.g[0-9a-f]{7,}(\.dirty)?_(amd64|arm64)\.deb$ ]] && ok "file name matches cably-desktop_10.0.6+cably.<yyyymmdd>.<N>.g<rev>[.dirty]_<arch>.deb" || bad "file name '$NAME' does not match ^cably-desktop_10.0.6+cably.<yyyymmdd>.<N>.g<rev>[.dirty]_<arch>.deb$"
   local field; field(){ dpkg-deb --field "$DEB" "$1" 2>/dev/null; }
   [ "$(field Package)" = "$PKG" ] && ok "Package: $PKG" || bad "Package: '$(field Package)'"
   local V; V=$(field Version)
-  [[ "$V" =~ ^10\.0\.6\+cably\.[0-9]{8}\.[0-9a-f]{7,}$ ]] && ok "Version: $V" || bad "Version: '$V' (want 10.0.6+cably.<yyyymmdd>.<rev>)"
+  local VDATE="" VCOUNT=""
+  if [[ "$V" =~ ^10\.0\.6\+cably\.([0-9]{8})\.([0-9]+)\.g([0-9a-f]{7,})(\.dirty)?$ ]]; then
+    VDATE=${BASH_REMATCH[1]}; VCOUNT=${BASH_REMATCH[2]}
+    ok "Version: $V = 10.0.6+cably.<yyyymmdd>.<N>.g<rev>[.dirty] (day $VDATE, N=$VCOUNT, rev ${BASH_REMATCH[3]}${BASH_REMATCH[4]:+, dirty})"
+  else bad "Version: '$V' (want 10.0.6+cably.<yyyymmdd>.<N>.g<rev>[.dirty], N = commits since the 10.0.6 tag)"; fi
+  if command -v dpkg >/dev/null; then
+    local LATER; LATER=$(synth_later "$V")
+    dpkg --compare-versions "$LATER" gt "$V" && ok "dpkg: a later build of the same day, $LATER, sorts greater than $V" || bad "dpkg: a later build of the same day, $LATER, does NOT sort greater than $V (the hex rev compares as text: an upgrade can look like a downgrade)"
+    if [ -n "$VCOUNT" ] && [ "$VCOUNT" -gt 0 ]; then
+      local EARLIER="10.0.6+cably.$VDATE.$((VCOUNT-1)).gffffffffff"
+      dpkg --compare-versions "$EARLIER" lt "$V" && ok "dpkg: the previous build of the day, $EARLIER, sorts lower" || bad "dpkg: $EARLIER does not sort lower than $V"
+    fi
+    if [ -n "$VDATE" ]; then
+      local NEXTDAY="10.0.6+cably.$((VDATE+1)).0.g0000000000"
+      dpkg --compare-versions "$NEXTDAY" gt "$V" && ok "dpkg: a later day's build, $NEXTDAY, sorts greater" || bad "dpkg: $NEXTDAY does not sort greater than $V"
+    fi
+  else echo "  note no dpkg here: the version ordering is not checked"; fi
   local A; A=$(field Architecture)
   if command -v dpkg >/dev/null; then [ "$A" = "$(dpkg --print-architecture)" ] && ok "Architecture: $A (this dpkg's)" || bad "Architecture: '$A' (this dpkg: $(dpkg --print-architecture))"
   else [[ "$A" =~ ^(amd64|arm64)$ ]] && ok "Architecture: $A" || bad "Architecture: '$A'"; fi
@@ -108,7 +155,7 @@ static_checks(){ # $1 deb
   grep -qE "^-rwxr-xr-x root/root .* \./opt/cably-desktop/bin/kicad$" <<<"$C" && ok "bin/kicad is root-owned 0755" || bad "bin/kicad ownership/mode: $(grep ' \./opt/cably-desktop/bin/kicad$' <<<"$C")"
 
   local X; X=$(mktemp -d)
-  dpkg-deb --fsys-tarfile "$DEB" | tar -x -C "$X" ./usr/share/doc/cably-desktop/copyright ./usr/share/applications/org.cably.desktop.desktop ./opt/cably-desktop/bin/kicad-cli 2>/dev/null
+  dpkg-deb --fsys-tarfile "$DEB" | tar -x -C "$X" ./usr/share/doc/cably-desktop/copyright ./usr/share/applications/org.cably.desktop.desktop ./opt/cably-desktop/bin/kicad-cli ./opt/cably-desktop/lib 2>/dev/null
   grep -q "/usr/share/common-licenses/GPL-3" "$X/usr/share/doc/cably-desktop/copyright" 2>/dev/null && ok "copyright points at /usr/share/common-licenses/GPL-3" || bad "copyright does not point at GPL-3"
   grep -q "NOTICE.md" "$X/usr/share/doc/cably-desktop/copyright" 2>/dev/null && ok "copyright points at NOTICE.md" || bad "copyright does not mention NOTICE.md"
   grep -q "The KiCad Developers" "$X/usr/share/doc/cably-desktop/copyright" 2>/dev/null && ok "copyright credits The KiCad Developers" || bad "copyright lacks the KiCad attribution"
@@ -117,6 +164,12 @@ static_checks(){ # $1 deb
   if command -v file >/dev/null; then
     file -b "$X/opt/cably-desktop/bin/kicad-cli" | grep -q "not stripped" && bad "bin/kicad-cli is not stripped" || ok "bin/kicad-cli is stripped ($(file -b "$X/opt/cably-desktop/bin/kicad-cli" | cut -d, -f1))"
   fi
+  # the packaged kicad-cli itself (its $ORIGIN RPATH finds the packaged lib/ next to it):
+  # what it says it is must be what the package Version says.
+  local BV; BV=$(HOME="${HOME:-$X}" "$X/opt/cably-desktop/bin/kicad-cli" version --format about 2>/dev/null | sed -n 's/^Version: \([^,]*\).*/\1/p' | head -1)
+  if [ -n "$BV" ]; then rev_check "$BV" "$V" "packaged kicad-cli"
+  elif [ "$REV_CHECK_AFTER_INSTALL" = 1 ]; then echo "  note packaged kicad-cli does not run before the install (its libraries are not here yet): its rev is checked after (b)"
+  else bad "packaged kicad-cli does not run here ($(ldd "$X/opt/cably-desktop/bin/kicad-cli" 2>&1 | grep -c 'not found') libraries not found): cannot compare its rev with the package Version"; fi
   rm -rf "$X"
 }
 
@@ -124,6 +177,7 @@ static_checks(){ # $1 deb
 inner(){ # $1 deb (absolute)
   local DEB="$1"
   export DEBIAN_FRONTEND=noninteractive LANG=C.UTF-8 LC_ALL=C.UTF-8
+  REV_CHECK_AFTER_INSTALL=1
   static_checks "$DEB"
   section "(b) install on $(. /etc/os-release && echo "$PRETTY_NAME") ($(uname -m)), fresh"
   dpkg -s "$PKG" >/dev/null 2>&1 && bad "$PKG already installed here: not a fresh system" || ok "$PKG not installed before"
@@ -137,6 +191,8 @@ inner(){ # $1 deb (absolute)
   local V; V=$(/opt/cably-desktop/bin/kicad-cli version 2>&1 | head -1)
   case "$V" in 10.0.6*) ok "kicad-cli version: $V" ;; *) bad "kicad-cli: $V" ;; esac
   /opt/cably-desktop/bin/kicad-cli version --format about 2>/dev/null | grep -E "^(Application|Version)" | sed 's/^/       /'
+  local BV; BV=$(/opt/cably-desktop/bin/kicad-cli version --format about 2>/dev/null | sed -n 's/^Version: \([^,]*\).*/\1/p' | head -1)
+  rev_check "$BV" "$(dpkg-query -W -f='${Version}' "$PKG" 2>/dev/null)" "installed kicad-cli"
   [ "$(command -v cably-desktop)" = /usr/bin/cably-desktop ] && [ -x /usr/bin/cably-desktop ] && ok "cably-desktop on PATH -> $(readlink -f /usr/bin/cably-desktop)" || bad "cably-desktop not on PATH / not executable"
   grep -q "^10.0.6" <<<"$(cably-desktop-cli version 2>/dev/null)" && ok "cably-desktop-cli runs" || bad "cably-desktop-cli does not run"
   [ -r /usr/share/icons/hicolor/48x48/apps/org.cably.desktop.png ] && ok "icon link resolves: /usr/share/icons/hicolor/48x48/apps/org.cably.desktop.png" || bad "icon link dangling"
