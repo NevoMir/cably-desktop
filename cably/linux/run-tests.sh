@@ -42,11 +42,19 @@
 #      fixtures (cably/tests/fixtures by default): key completeness + the render oracle.
 #  (4) The installed manager (/opt/cably-desktop/bin/kicad) launches under Xvfb
 #      (xvfb-run -a), is still alive after 12 s, and exits on SIGTERM.
+#  (5) cably/tests/identity-linux.sh on the installed tree: launchers, icons, metainfo
+#      and binaries present the product as Cably Desktop, based on KiCad.
+#  (6) cably/linux/package-deb.sh writes the .deb into $CABLY_DEB_DIR (default
+#      $CABLY_BUILD_DIR/deb) and cably/tests/deb.sh checks it: the static assertions
+#      here, and the fresh-Ubuntu install + launch + theme.sh when a Docker daemon (or
+#      root) is available - inside the build container that phase is reported as a WARN
+#      with the command to run on the Docker host.
 set -uo pipefail
 FORK="${CABLY_FORK:-/src}"
 BUILD="${CABLY_BUILD_DIR:-/build}"
 PREFIX="${CABLY_PREFIX:-/opt/cably-desktop}"
 FIX="${CABLY_FIXTURES:-$FORK/cably/tests/fixtures}"
+DEBDIR="${CABLY_DEB_DIR:-$BUILD/deb}"
 LAUNCH_SECS="${CABLY_LAUNCH_SECS:-12}"
 CXX="${CXX:-clang++}"
 WXCONFIG="${CABLY_WX_CONFIG:-$(command -v wx-config || true)}"
@@ -64,7 +72,7 @@ if [ ! -w "${HOME:-/nonexistent}" ]; then export HOME="$T/home"; mkdir -p "$HOME
 export LANG="${LANG:-C.UTF-8}" LC_ALL="${LC_ALL:-C.UTF-8}"
 T_ALL=$(date +%s)
 
-echo "run-tests.sh: fork=$FORK build=$BUILD prefix=$PREFIX fixtures=$FIX ($(uname -sm), $(. /etc/os-release 2>/dev/null && echo "$PRETTY_NAME"))"
+echo "run-tests.sh: fork=$FORK build=$BUILD prefix=$PREFIX fixtures=$FIX deb=$DEBDIR ($(uname -sm), $(. /etc/os-release 2>/dev/null && echo "$PRETTY_NAME"))"
 
 # (1) ----------------------------------------------------------------------------
 section "(1) unit tests"
@@ -150,6 +158,25 @@ else
   fi
 fi
 
+# (5) ----------------------------------------------------------------------------
+section "(5) cably/tests/identity-linux.sh on $PREFIX"
+if CABLY_FORK="$FORK" CABLY_PREFIX="$PREFIX" bash "$FORK/cably/tests/identity-linux.sh" >"$T/identity.log" 2>&1; then
+  ok "identity-linux.sh: PASS ($(grep -c '^  ok' "$T/identity.log") checks)"
+else sed 's/^/     /' "$T/identity.log" | grep -vE "^     +ok"; bad "identity-linux.sh: FAIL ($(grep -c '^  FAIL' "$T/identity.log") failing checks, see above)"; fi
+
+# (6) ----------------------------------------------------------------------------
+section "(6) cably/linux/package-deb.sh -> $DEBDIR, then cably/tests/deb.sh"
+if [ -f "$BUILD/CMakeCache.txt" ] && [ -x "$PREFIX/bin/kicad" ]; then
+  T0=$(date +%s)
+  if CABLY_FORK="$FORK" CABLY_BUILD_DIR="$BUILD" CABLY_PREFIX="$PREFIX" CABLY_DEB_DIR="$DEBDIR" bash "$FORK/cably/linux/package-deb.sh" >"$T/deb-build.log" 2>&1; then
+    DEB=$(tail -1 "$T/deb-build.log")
+    grep -E '^package-deb\.sh:' "$T/deb-build.log" | sed 's/^/     /'
+    [ -f "$DEB" ] && ok "package-deb.sh wrote $(basename "$DEB") ($(du -h "$DEB" | cut -f1)) in $(( $(date +%s) - T0 )) s" || bad "package-deb.sh printed no .deb path: $(tail -3 "$T/deb-build.log")"
+    if CABLY_FORK="$FORK" CABLY_LAUNCH_SECS="$LAUNCH_SECS" bash "$FORK/cably/tests/deb.sh" "$DEB" >"$T/deb.log" 2>&1; then
+      sed 's/^/     /' "$T/deb.log"; ok "deb.sh: PASS ($(grep -c '^  ok' "$T/deb.log") checks$(grep -q '^  WARN' "$T/deb.log" && echo '; install phase deferred to a Docker host, see WARN'))"
+    else sed 's/^/     /' "$T/deb.log"; bad "deb.sh: FAIL ($(grep -c '^  FAIL' "$T/deb.log") failing checks, see above)"; fi
+  else sed 's/^/     /' "$T/deb-build.log" | tail -20; bad "package-deb.sh failed"; fi
+else bad "no build/install to package (run cably/linux/build.sh first)"; fi
 
 echo
 echo "run-tests.sh: $(( $(date +%s) - T_ALL )) s"

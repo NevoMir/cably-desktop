@@ -125,5 +125,16 @@ if( UNIX AND NOT APPLE )
         target_link_libraries( ${_cably_target} ${CABLY_LIBSECRET_LIBRARIES} )
     endforeach()
 
+    # The product's icon theme tree (cably/linux/make-icons.sh renders it from
+    # cably/icons/src; the PNGs are committed).  resources/CMakeLists.txt installs KiCad's
+    # tree filtered by KICAD_ICON_PREFIX, which cably/linux/CablyLinuxNames.cmake points at
+    # these names, so KiCad's own app icons stay out of the installed tree.
+    install( DIRECTORY ${CMAKE_CURRENT_LIST_DIR}/linux/icons/
+             DESTINATION ${CMAKE_INSTALL_DATADIR}/icons
+             COMPONENT resources
+             FILES_MATCHING
+             PATTERN "*.png"
+             PATTERN "*.svg"
+             )
 endif()
 # ---- end Linux port ----

@@ -20,11 +20,17 @@ image.
         cably-desktop-linux-build:ubuntu24.04 /src/cably/linux/build.sh
 
     # 4. tests (unit tests, bridge.sh against the build tree incl. the secret store,
-    #    theme.sh with the installed kicad-cli, launch under Xvfb)
+    #    theme.sh with the installed kicad-cli, launch under Xvfb, identity-linux.sh,
+    #    package-deb.sh + deb.sh's static checks; the .deb lands in /build/deb)
     docker run --rm --cpus 8 \
         -v "$PWD":/src:ro -v cably-linux-build:/build -v cably-linux-install:/opt/cably-desktop \
         cably-desktop-linux-build:ubuntu24.04 /src/cably/linux/run-tests.sh
 
+    # 5. the package's install test needs a FRESH Ubuntu, i.e. a Docker host: copy the
+    #    .deb out of the volume and run deb.sh here (it starts `docker run --rm ubuntu:24.04`,
+    #    apt-installs the .deb, launches the manager under Xvfb and runs theme.sh)
+    docker run --rm -v cably-linux-build:/build -v "$PWD/dist":/dist ubuntu:24.04 cp /build/deb/cably-desktop_*.deb /dist/
+    cably/tests/deb.sh dist/cably-desktop_*.deb
 
 ## The scripts
 
@@ -38,10 +44,25 @@ image.
   (default 6), `CABLY_CMAKE_EXTRA`.
 - `run-tests.sh` prints one `ok`/`FAIL` line per check and exits 1 on any FAIL; it is red
   on an empty build volume by design. Knobs: the same plus `CABLY_FIXTURES` (default
-  `cably/tests/fixtures`).
+  `cably/tests/fixtures`) and `CABLY_DEB_DIR` (default `$CABLY_BUILD_DIR/deb`).
+- `package-deb.sh` writes `cably-desktop_10.0.6+cably.<yyyymmdd>.<git rev>_<arch>.deb`
+  into `$CABLY_DEB_DIR` (default: cwd): a stripped `cmake --install` of the build under
+  `/opt/cably-desktop`, launchers copied to `/usr/share/applications` with an absolute
+  `Exec=`, icons/metainfo/MIME linked into `/usr/share`, `/usr/bin/cably-desktop{,-cli}`,
+  `/usr/share/doc/cably-desktop/{copyright,NOTICE.md,CHANGES.md.gz}`; `Depends` come from
+  `dpkg-shlibdeps` over the binaries plus `libsecret-1-0` and `python3`. Test:
+  `cably/tests/deb.sh`.
+- `make-icons.sh` renders `cably/icons/src/*.svg` into `icons/hicolor` (the PNGs are
+  committed; rerun after editing an SVG; needs `rsvg-convert`).
+- `CablyLinuxNames.cmake` is the product's desktop identity (`org.cably.desktop*`
+  launchers, metainfo id, icon names), included at the end of `cmake/KiCadAppNames.cmake`
+  so both consumers of those variables (the Wayland app_id in `common/` and the
+  `resources/` metadata rules) see it. The launcher/metainfo text lives, edited in place,
+  in `resources/linux` (see CHANGES.md).
 
 The macOS-only acceptance scripts (`home.sh`, `identity.sh`, `icons.sh`, `dmg.sh`) are not
-run here: they inspect an `.app` bundle.
+run here: they inspect an `.app` bundle; `identity-linux.sh` and `deb.sh` are their Linux
+counterparts.
 
 ## Linux specifics
 
@@ -51,3 +72,6 @@ run here: they inspect an `.app` bundle.
   written temp-then-rename). A reachable service that fails is an error, never a silent
   fallback. Unit test: `cably/tests/unit/test_cably_secret_store.cpp` (a fake service
   behind the `CABLY_SECRET_SERVICE` seam); CLI round-trip: `cably/tests/bridge.sh` (e).
+- The package installs under `/opt/cably-desktop` and never owns a path a distribution
+  `kicad` package ships (no `kicad-*.xml` MIME files or `application-x-kicad-*` icons
+  under `/usr/share`), so both can be installed side by side.

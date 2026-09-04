@@ -57,6 +57,11 @@ cmake -S "$SRC" -B "$BUILD" -G Ninja \
 echo "build.sh: configure took $(( $(secs) - T0 )) s"
 
 # 2. build (all + the test CLI, which is EXCLUDE_FROM_ALL) ----------------------
+# A tree configured before the Cably desktop ids (cably/linux/CablyLinuxNames.cmake) still
+# holds KiCad-named metadata outputs that nothing regenerates or removes, and
+# resources/CMakeLists.txt installs the whole directory: drop them so an incremental tree
+# installs exactly what a fresh one does.
+find "$BUILD/resources/linux" -type f -name 'org.kicad.*' ! -name '*.in' -delete 2>/dev/null || true
 T0=$(secs)
 ninja -C "$BUILD" -j"$JOBS"
 ninja -C "$BUILD" -j"$JOBS" cably-bridge-cli
