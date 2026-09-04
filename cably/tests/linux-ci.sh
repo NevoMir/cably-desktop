@@ -37,6 +37,11 @@
 #      on a v* tag attaches it to a GitHub Release whose body carries the required sentence.
 #      No secrets beyond the job's own GITHUB_TOKEN.  Trademark: the product is
 #      "Cably Desktop"; KiCad is named only as attribution.
+#  (d) cably/linux/icons: every PNG cably/linux/make-icons.sh renders (each scalable SVG at
+#      each of its sizes) is on disk AND tracked by git, and no icon file matches an ignore
+#      pattern.  KiCad's root .gitignore ignores *.png (its generated bitmaps), which
+#      silently kept the 84 rendered icons out of the repository: a fresh checkout (CI)
+#      installed no PNG app/MIME icons and identity-linux.sh failed 37 checks.
 set -uo pipefail
 FORK="${CABLY_FORK:-$(cd "$(dirname "$0")/../.." && pwd)}"
 WF="$FORK/.github/workflows/linux.yml"
@@ -140,6 +145,38 @@ has 'Cably Desktop' && ok "product name Cably Desktop appears" || bad "product n
 MARK="Cably K"; MARK="${MARK}iCad"   # assembled so this file itself never carries the phrase
 (cd "$FORK" && git grep -q "$MARK" -- .) && bad "trademark: the product name followed by the KiCad mark appears in the tree" || ok "trademark grep empty"
 grep -qiE 'kicad desktop|kicad cably' "$WF" && bad "workflow names the product with the KiCad mark" || ok "workflow never names the product with the KiCad mark"
+
+# (d) ----------------------------------------------------------------------------
+section "(d) cably/linux/icons: the rendered PNGs are tracked"
+ICONS="$FORK/cably/linux/icons"
+MAKE="$FORK/cably/linux/make-icons.sh"
+if [ -d "$ICONS/hicolor/scalable" ] && [ -f "$MAKE" ]; then
+  SIZES=$(sed -n 's/^SIZES="\(.*\)"$/\1/p' "$MAKE")
+  [ -n "$SIZES" ] && ok "make-icons.sh sizes: $SIZES" || bad "cannot read SIZES= from $MAKE"
+  EXPECTED=""   # every file make-icons.sh writes: the SVG copies and one PNG per size
+  for svg in "$ICONS"/hicolor/scalable/*/*.svg; do
+    kind=$(basename "$(dirname "$svg")"); name=$(basename "$svg" .svg)
+    EXPECTED="$EXPECTED cably/linux/icons/hicolor/scalable/$kind/$name.svg"
+    for px in $SIZES; do EXPECTED="$EXPECTED cably/linux/icons/hicolor/${px}x${px}/$kind/$name.png"; done
+  done
+  N_EXPECTED=$(echo "$EXPECTED" | wc -w | tr -d ' ')
+  [ "$N_EXPECTED" -ge 96 ] && ok "$N_EXPECTED icon files expected (12 SVGs x (1 + $(echo "$SIZES" | wc -w | tr -d ' ') sizes))" || bad "only $N_EXPECTED icon files expected from $(ls "$ICONS"/hicolor/scalable/*/*.svg 2>/dev/null | wc -l | tr -d ' ') scalable SVGs (want 12 x 8 = 96)"
+  MISSING=""; UNTRACKED=""; IGNORED=""
+  TRACKED=$(cd "$FORK" && git ls-files -- cably/linux/icons)
+  for f in $EXPECTED; do
+    [ -f "$FORK/$f" ] || { MISSING="$MISSING $f"; continue; }
+    echo "$TRACKED" | grep -qx "$f" || UNTRACKED="$UNTRACKED $f"
+    (cd "$FORK" && git check-ignore -q --no-index "$f") && IGNORED="$IGNORED $f"
+  done
+  count(){ echo "$1" | wc -w | tr -d ' '; }
+  [ -z "$MISSING" ] && ok "every expected icon file is on disk" || bad "$(count "$MISSING") icon files missing on disk (run cably/linux/make-icons.sh): $(echo "$MISSING" | tr ' ' '\n' | grep . | head -3 | tr '\n' ' ')"
+  [ -z "$UNTRACKED" ] && ok "every expected icon file is tracked by git ($(echo "$TRACKED" | grep -c . ) files under cably/linux/icons)" || bad "$(count "$UNTRACKED") icon files are NOT tracked by git (a fresh clone installs no PNG icons): $(echo "$UNTRACKED" | tr ' ' '\n' | grep . | head -3 | tr '\n' ' ')..."
+  [ -z "$IGNORED" ] && ok "no icon file matches an ignore pattern (git check-ignore --no-index)" || bad "$(count "$IGNORED") icon files match an ignore pattern: $(cd "$FORK" && git check-ignore -v --no-index "$(echo "$IGNORED" | awk '{print $1}')" | head -1)"
+  N_TRACKED=$(echo "$TRACKED" | grep -cE '\.(png|svg)$')
+  [ "$N_TRACKED" = "$N_EXPECTED" ] && ok "git tracks exactly the $N_EXPECTED expected icon files" || bad "git tracks $N_TRACKED icon files under cably/linux/icons, expected $N_EXPECTED"
+  STRAY=$(cd "$FORK" && find cably/linux/icons -type f \( -name '*.png' -o -name '*.svg' \) | grep -vxF -f <(echo "$EXPECTED" | tr ' ' '\n' | grep .) || true)
+  [ -z "$STRAY" ] && ok "no stray icon files beside the expected ones" || bad "icon files make-icons.sh does not produce: $(echo "$STRAY" | head -3 | tr '\n' ' ')"
+else bad "missing $ICONS/hicolor/scalable or $MAKE (run cably/linux/make-icons.sh)"; fi
 
 echo
 [ "$fail" = 0 ] && echo "linux-ci.sh: PASS" || echo "linux-ci.sh: FAIL"

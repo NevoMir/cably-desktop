@@ -56,7 +56,8 @@
  *                (exit 3 when the timeout passed with no event)
  *   save         store the seeded session;  show  print the stored session;  signout  clear it
  *                (all three print store_backend= for --store keychain: keychain,
- *                secret-service or file:<path>)
+ *                secret-service or file:<path>, and on Linux store_note= with why the
+ *                Secret Service was not used, when it was not)
  */
 
 // kicad_curl headers must precede any wxWidgets header.
@@ -230,7 +231,13 @@ int main( int argc, char** argv )
     auto printStoreBackend = [&]()
     {
         if( auto* kc = dynamic_cast<CABLY_KEYCHAIN_SECRET_STORE*>( store.get() ) )
+        {
             std::printf( "store_backend=%s\n", kc->Backend().c_str() );
+
+            // Linux: why the Secret Service was not used (a bus without a keyring, say).
+            if( !kc->Note().empty() )
+                std::printf( "store_note=%s\n", kc->Note().c_str() );
+        }
     };
 
     int rc = 0;

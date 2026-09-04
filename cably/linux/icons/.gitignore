@@ -1,0 +1,5 @@
+# The rendered icon theme under hicolor/ is committed (cably/linux/make-icons.sh writes it;
+# the build and the CI checkout need no renderer).  KiCad's root .gitignore ignores *.png
+# for its generated bitmaps; this deeper file re-includes ours (cably/tests/linux-ci.sh (d)
+# fails when a rendered icon is not tracked).
+!*.png

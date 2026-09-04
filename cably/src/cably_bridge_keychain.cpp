@@ -27,13 +27,21 @@
  * -framework CoreFoundation (see cably/CMakeLists.txt).
  *
  * Linux (and other Unix): libsecret (the freedesktop Secret Service: GNOME Keyring,
- * KWallet's bridge, KeePassXC ...) when a service is reachable on the session bus, with
+ * KWallet's bridge, KeePassXC ...) when a service ANSWERS on the session bus, with
  * schema "dev.cably.desktop" {service, account="session"} in the default collection;
  * otherwise the documented fallback file $XDG_CONFIG_HOME/cably-desktop/session.json
- * (0600, directory 0700, temp-then-rename).  The libsecret half sits behind
- * CABLY_SECRET_SERVICE so cably/tests/unit/test_cably_secret_store.cpp drives the store
- * with a fake keyring; built with -DCABLY_HAVE_LIBSECRET=1 + `pkg-config libsecret-1`
- * (cably/CMakeLists.txt does that for the app and the CLI).
+ * (0600, directory 0700, temp-then-rename).  "Answers" is probed, not assumed: a GDBus
+ * proxy for org.freedesktop.secrets is created without error on any bus, owner or not,
+ * so the probe opens a libsecret session (OpenSession, which also D-Bus-activates a
+ * keyring that is installed but not running) under a watchdog (CABLY_SECRET_SERVICE_TIMEOUT_MS,
+ * default 5000): no bus, a bus nobody listens on, a bus without a keyring (GitHub's
+ * ubuntu runners: "The name org.freedesktop.secrets was not provided by any .service
+ * files"), or a bus that never replies all mean "use the file".  A D-Bus error in the
+ * middle of a lookup/store/clear means the same, and drops the cached service so the
+ * next call probes afresh.  The libsecret half sits behind CABLY_SECRET_SERVICE so
+ * cably/tests/unit/test_cably_secret_store.cpp drives the store with a fake keyring;
+ * built with -DCABLY_HAVE_LIBSECRET=1 + `pkg-config libsecret-1` (cably/CMakeLists.txt
+ * does that for the app and the CLI).
  *
  * Windows (Credential Manager) is NOT implemented yet: every call fails with LastError()
  * set, so the app falls back to signing in each launch.
@@ -230,14 +238,24 @@ bool CABLY_KEYCHAIN_SECRET_STORE::Clear()
     return false;
 }
 
+
+bool CABLY_KEYCHAIN_SECRET_STORE::serviceAnswers()
+{
+    return false; // no Secret Service seam on macOS: the keychain is the only store
+}
+
 #else // not __APPLE__: Linux and other Unix
 
 #include <cably_config.h>
 
 #include <cerrno>
+#include <chrono>
+#include <condition_variable>
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
+#include <mutex>
+#include <thread>
 
 #include <fcntl.h>
 #include <sys/stat.h>
@@ -279,12 +297,82 @@ std::string takeError( GError*& aError, const char* aWhat )
 }
 
 
+/// How long one probe or call may take before the service counts as unreachable.
+unsigned serviceTimeoutMs()
+{
+    const char* env = std::getenv( "CABLY_SECRET_SERVICE_TIMEOUT_MS" );
+
+    if( env && *env )
+    {
+        long v = std::strtol( env, nullptr, 10 );
+
+        if( v > 0 && v < 600000 )
+            return static_cast<unsigned>( v );
+    }
+
+    return 5000;
+}
+
+
+/**
+ * Cancels a GCancellable after a deadline from a helper thread, so a synchronous GDBus
+ * call (including the connection + authentication handshake, which the proxy default
+ * timeout does not cover) can never hang the app on a broken bus.
+ */
+class SERVICE_WATCHDOG
+{
+public:
+    explicit SERVICE_WATCHDOG( unsigned aTimeoutMs ) :
+            m_cancellable( g_cancellable_new() ),
+            m_thread( [this, aTimeoutMs]()
+                      {
+                          std::unique_lock<std::mutex> lock( m_mutex );
+
+                          if( !m_done.wait_for( lock, std::chrono::milliseconds( aTimeoutMs ),
+                                                [this]() { return m_finished; } ) )
+                          {
+                              m_firedTimeout = true;
+                              g_cancellable_cancel( m_cancellable );
+                          }
+                      } )
+    {
+    }
+
+    ~SERVICE_WATCHDOG()
+    {
+        {
+            std::lock_guard<std::mutex> lock( m_mutex );
+            m_finished = true;
+        }
+
+        m_done.notify_all();
+        m_thread.join();
+        g_object_unref( m_cancellable );
+    }
+
+    GCancellable* Cancellable() const { return m_cancellable; }
+    bool          TimedOut() const { return m_firedTimeout; }
+
+private:
+    GCancellable*           m_cancellable;
+    std::mutex              m_mutex;
+    std::condition_variable m_done;
+    bool                    m_finished = false;
+    bool                    m_firedTimeout = false;
+    std::thread             m_thread;
+};
+
+
 /// libsecret against the session bus.
 class LIBSECRET_SERVICE : public CABLY_SECRET_SERVICE
 {
 public:
-    bool Available() override
+    ~LIBSECRET_SERVICE() override { dropService(); }
+
+    bool Available( std::string& aReason ) override
     {
+        aReason.clear();
+
         // With no session bus at all (containers, CI, ssh) GDBus would try to autolaunch
         // one through X11, which blocks under Xvfb; the fallback file is the answer there.
         const char* addr = std::getenv( "DBUS_SESSION_BUS_ADDRESS" );
@@ -298,19 +386,51 @@ public:
                 return false;
         }
 
-        GError*        error = nullptr;
-        SecretService* service = secret_service_get_sync( SECRET_SERVICE_NONE, nullptr, &error );
+        if( m_service )
+            return true; // probed earlier in this process and no call has failed since
 
-        if( error )
+        const unsigned   timeoutMs = serviceTimeoutMs();
+        SERVICE_WATCHDOG watchdog( timeoutMs );
+        GError*          error = nullptr;
+
+        // Connects to the bus (or fails right away when nobody listens at the address);
+        // the proxy itself is created whether or not the name has an owner.
+        SecretService* service = secret_service_get_sync( SECRET_SERVICE_NONE, watchdog.Cancellable(), &error );
+
+        if( !service )
         {
-            g_error_free( error );
+            aReason = takeError( error, watchdog.TimedOut() ? "secret service: no answer from the session bus"
+                                                            : "secret service" );
             return false;
         }
 
-        if( !service )
-            return false;
+        if( error )
+            g_error_free( error );
 
-        g_object_unref( service );
+        // Every later call on this proxy (the probe's OpenSession, then the lookups and
+        // stores libsecret makes through it) is bounded the same way.
+        g_dbus_proxy_set_default_timeout( G_DBUS_PROXY( service ), static_cast<gint>( timeoutMs ) );
+
+        // The real question: does anything answer as org.freedesktop.secrets?  OpenSession
+        // is the first call libsecret would make anyway; on a bus without a keyring D-Bus
+        // answers "The name org.freedesktop.secrets was not provided by any .service files"
+        // at once, an installed keyring gets activated, and a hung one trips the watchdog.
+        error = nullptr;
+
+        if( !secret_service_ensure_session_sync( service, watchdog.Cancellable(), &error ) )
+        {
+            aReason = takeError( error, watchdog.TimedOut() ? "secret service: no answer within the timeout"
+                                                            : "secret service" );
+            g_object_unref( service );
+            return false;
+        }
+
+        if( error )
+            g_error_free( error );
+
+        // Kept: libsecret hands the password calls this cached instance (session already
+        // open, timeout set) instead of connecting again; dropped on the first failure.
+        m_service = service;
         return true;
     }
 
@@ -324,6 +444,7 @@ public:
         if( error )
         {
             aError = takeError( error, "secret service lookup" );
+            dropService();
             return false;
         }
 
@@ -346,6 +467,7 @@ public:
         if( error )
         {
             aError = takeError( error, "secret service store" );
+            dropService();
             return false;
         }
 
@@ -362,11 +484,24 @@ public:
         if( error )
         {
             aError = takeError( error, "secret service clear" );
+            dropService();
             return false;
         }
 
         return true;
     }
+
+private:
+    void dropService()
+    {
+        if( m_service )
+        {
+            g_object_unref( m_service );
+            m_service = nullptr;
+        }
+    }
+
+    SecretService* m_service = nullptr;
 };
 
 
@@ -539,8 +674,9 @@ CABLY_KEYCHAIN_SECRET_STORE::CABLY_KEYCHAIN_SECRET_STORE( const std::string& aSe
 bool CABLY_KEYCHAIN_SECRET_STORE::Load( CABLY_SESSION& aOut )
 {
     m_error.clear();
+    m_note.clear();
 
-    if( m_secretService && m_secretService->Available() )
+    if( serviceAnswers() )
     {
         std::string json, err;
 
@@ -557,14 +693,10 @@ bool CABLY_KEYCHAIN_SECRET_STORE::Load( CABLY_SESSION& aOut )
             return true;
         }
 
+        // An error is the service going away under us: the file is the store now.  No
+        // error and no item: a session saved while the service was away may be in the file.
         if( !err.empty() )
-        {
-            m_backend = "secret-service";
-            m_error = "secret service read failed: " + err;
-            return false;
-        }
-
-        // No item: a session saved while the service was away may be in the file.
+            m_note = "secret service read failed, using the file: " + err;
     }
 
     const std::string path = FallbackPath( m_fallbackDir, m_service );
@@ -590,22 +722,22 @@ bool CABLY_KEYCHAIN_SECRET_STORE::Load( CABLY_SESSION& aOut )
 bool CABLY_KEYCHAIN_SECRET_STORE::Save( const CABLY_SESSION& aSession )
 {
     m_error.clear();
+    m_note.clear();
     const std::string json = CablySessionToJson( aSession );
     const std::string path = FallbackPath( m_fallbackDir, m_service );
 
-    if( m_secretService && m_secretService->Available() )
+    if( serviceAnswers() )
     {
-        m_backend = "secret-service";
         std::string err;
 
-        if( !m_secretService->Store( m_service, json, err ) )
+        if( m_secretService->Store( m_service, json, err ) )
         {
-            m_error = "secret service write failed: " + err;
-            return false;
+            m_backend = "secret-service";
+            ::unlink( path.c_str() ); // migrate: nothing left on disk once the keyring has it
+            return true;
         }
 
-        ::unlink( path.c_str() ); // migrate: nothing left on disk once the keyring has it
-        return true;
+        m_note = "secret service write failed, using the file: " + err;
     }
 
     m_backend = "file:" + path;
@@ -624,32 +756,47 @@ bool CABLY_KEYCHAIN_SECRET_STORE::Save( const CABLY_SESSION& aSession )
 bool CABLY_KEYCHAIN_SECRET_STORE::Clear()
 {
     m_error.clear();
+    m_note.clear();
     const std::string path = FallbackPath( m_fallbackDir, m_service );
-    bool              ok = true;
+    bool              viaService = false;
 
-    if( m_secretService && m_secretService->Available() )
+    if( serviceAnswers() )
     {
-        m_backend = "secret-service";
         std::string err;
 
-        if( !m_secretService->Clear( m_service, err ) )
-        {
-            m_error = "secret service delete failed: " + err;
-            ok = false;
-        }
-    }
-    else
-    {
-        m_backend = "file:" + path;
+        if( m_secretService->Clear( m_service, err ) )
+            viaService = true;
+        else
+            m_note = "secret service delete failed: " + err;
     }
 
+    m_backend = viaService ? std::string( "secret-service" ) : "file:" + path;
+
+    // Whatever the service said, a file copy (from a spell without the service) goes.
     if( ::unlink( path.c_str() ) != 0 && errno != ENOENT )
     {
         m_error = "session file delete failed: " + errnoText( "cannot remove", path );
-        ok = false;
+        return false;
     }
 
-    return ok;
+    return true;
+}
+
+
+bool CABLY_KEYCHAIN_SECRET_STORE::serviceAnswers()
+{
+    if( !m_secretService )
+        return false;
+
+    std::string reason;
+
+    if( m_secretService->Available( reason ) )
+        return true;
+
+    if( !reason.empty() )
+        m_note = "secret service unavailable, using the file: " + reason;
+
+    return false;
 }
 
 #endif

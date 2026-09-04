@@ -241,32 +241,51 @@ if [ "$(uname)" = Darwin ]; then
 else
   # Linux: the same store is libsecret when a Secret Service answers on the session bus,
   # else the 0600 file under $XDG_CONFIG_HOME/cably-desktop (cably_bridge_keychain.cpp).
-  # Pointing XDG_CONFIG_HOME at a scratch dir keeps the test off the real config; without
-  # a session bus (container, CI, ssh) the file is the backend and the CLI says so.
-  SVC="dev.cably.desktop.test.$$"
-  KC=(--store keychain --keychain-service "$SVC")
-  export XDG_CONFIG_HOME="$T/xdg"
-  SESSION_FILE="$XDG_CONFIG_HOME/cably-desktop/session.$SVC.json"
-  "$CLI" "${KC[@]}" --token kc-token --refresh-token kc-refresh --email kc@example.com --expires-at 4102444800 save >"$T/kc1" 2>&1; rc=$?
-  if [ $rc = 0 ]; then
-    BACKEND=$(sed -n 's/^store_backend=//p' "$T/kc1")
-    case "$BACKEND" in
-      secret-service) ok "secret store: Secret Service reachable, item stored there (store_backend=$BACKEND)" ;;
-      "file:$SESSION_FILE")
-        ok "secret store: no Secret Service, fallback file used (store_backend=$BACKEND)"
-        [ "$(stat -c %a "$SESSION_FILE")" = 600 ] && ok "secret store: session file mode 0600" || bad "secret store: session file mode $(stat -c %a "$SESSION_FILE") (want 600)"
-        [ "$(stat -c %a "$XDG_CONFIG_HOME/cably-desktop")" = 700 ] && ok "secret store: cably-desktop dir mode 0700" || bad "secret store: dir mode $(stat -c %a "$XDG_CONFIG_HOME/cably-desktop") (want 700)"
-        grep -q "kc-token" "$SESSION_FILE" && ok "secret store: the file holds the session (tokens never printed by the CLI)" || bad "secret store: session file does not hold the token" ;;
-      *) bad "secret store: unexpected store_backend='$BACKEND' (want secret-service or file:$SESSION_FILE)" ;;
+  # Pointing XDG_CONFIG_HOME at a scratch dir keeps the test off the real config.  Three
+  # bus conditions, each of which must round-trip save -> show -> signout: the machine's
+  # own (a Secret Service when one answers, else the file), a session bus address nobody
+  # listens on, and - GitHub's ubuntu runners' condition, recreated with dbus-run-session -
+  # a real session bus with no Secret Service on it ("The name org.freedesktop.secrets was
+  # not provided by any .service files").  The last two MUST use the file, say why in
+  # store_note=, and finish well inside the probe timeout (the CLI must never wait on a
+  # bus that has nothing to say).
+  linux_secret_case(){ # $1 label  $2 want: any|file  $3 store_note must contain ("" = don't care)  $4.. command prefix
+    local label="$1" want="$2" notere="$3"; shift 3
+    local svc="dev.cably.desktop.test.$$.$RANDOM"
+    local kc=(--store keychain --keychain-service "$svc")
+    local xdg="$T/xdg-$RANDOM"
+    local file="$xdg/cably-desktop/session.$svc.json"
+    local t0 ms rc backend note out
+    t0=$(date +%s%N)
+    XDG_CONFIG_HOME="$xdg" "$@" "$CLI" "${kc[@]}" --token kc-token --refresh-token kc-refresh --email kc@example.com --expires-at 4102444800 save >"$T/kc-save" 2>&1; rc=$?
+    ms=$(( ( $(date +%s%N) - t0 ) / 1000000 ))
+    if [ $rc != 0 ]; then bad "$label: save failed on $(uname): $(cat "$T/kc-save")"; return; fi
+    backend=$(sed -n 's/^store_backend=//p' "$T/kc-save"); note=$(sed -n 's/^store_note=//p' "$T/kc-save")
+    case "$want:$backend" in
+      any:secret-service) ok "$label: Secret Service reachable, item stored there (store_backend=$backend)" ;;
+      *:"file:$file")
+        ok "$label: fallback file used (store_backend=$backend)"
+        [ "$(stat -c %a "$file")" = 600 ] && ok "$label: session file mode 0600" || bad "$label: session file mode $(stat -c %a "$file") (want 600)"
+        [ "$(stat -c %a "$xdg/cably-desktop")" = 700 ] && ok "$label: cably-desktop dir mode 0700" || bad "$label: dir mode $(stat -c %a "$xdg/cably-desktop") (want 700)"
+        grep -q "kc-token" "$file" && ok "$label: the file holds the session (tokens never printed by the CLI)" || bad "$label: session file does not hold the token" ;;
+      *) bad "$label: unexpected store_backend='$backend' (want $([ "$want" = any ] && echo "secret-service or ")file:$file)" ;;
     esac
-    OUT=$("$CLI" "${KC[@]}" show 2>&1)
-    echo "$OUT" | grep -q "email=kc@example.com" && echo "$OUT" | grep -q "access_token_len=8" && echo "$OUT" | grep -q "expires_at=4102444800" && ok "secret store: save -> show round-trips" || bad "secret store: show: $OUT"
-    echo "$OUT" | grep -q "^store_backend=$BACKEND$" && ok "secret store: show read the same backend" || bad "secret store: show backend differs: $(echo "$OUT" | grep store_backend)"
-    "$CLI" "${KC[@]}" signout >/dev/null 2>&1 && ok "secret store: signout" || bad "secret store: signout failed"
-    "$CLI" "${KC[@]}" show >/dev/null 2>&1 && bad "secret store: session survived signout" || ok "secret store: session gone after signout"
-    [ -e "$SESSION_FILE" ] && bad "secret store: $SESSION_FILE still exists after signout" || ok "secret store: no session file left after signout"
-  else bad "secret store: save failed on $(uname): $(cat "$T/kc1")"; fi
-  unset XDG_CONFIG_HOME
+    if [ -n "$notere" ]; then
+      echo "$note" | grep -qF -- "$notere" && ok "$label: store_note says why: $note" || bad "$label: store_note='$note' (want it to mention '$notere')"
+    fi
+    [ "$ms" -lt 4000 ] && ok "$label: save took $ms ms (the probe fails fast)" || bad "$label: save took $ms ms (the probe must not wait on a bus with nothing to say)"
+    out=$(XDG_CONFIG_HOME="$xdg" "$@" "$CLI" "${kc[@]}" show 2>&1)
+    echo "$out" | grep -q "email=kc@example.com" && echo "$out" | grep -q "access_token_len=8" && echo "$out" | grep -q "expires_at=4102444800" && ok "$label: save -> show round-trips" || bad "$label: show: $out"
+    echo "$out" | grep -q "^store_backend=$backend$" && ok "$label: show read the same backend" || bad "$label: show backend differs: $(echo "$out" | grep store_backend)"
+    XDG_CONFIG_HOME="$xdg" "$@" "$CLI" "${kc[@]}" signout >/dev/null 2>&1 && ok "$label: signout" || bad "$label: signout failed"
+    XDG_CONFIG_HOME="$xdg" "$@" "$CLI" "${kc[@]}" show >/dev/null 2>&1 && bad "$label: session survived signout" || ok "$label: session gone after signout"
+    [ -e "$file" ] && bad "$label: $file still exists after signout" || ok "$label: no session file left after signout"
+  }
+  linux_secret_case "secret store" any "" env
+  linux_secret_case "secret store (bus nobody listens on)" file "unavailable" env DBUS_SESSION_BUS_ADDRESS=unix:path=/nonexistent/cably-bus
+  if command -v dbus-run-session >/dev/null; then
+    linux_secret_case "secret store (bus without a Secret Service)" file "org.freedesktop.secrets" dbus-run-session --
+  else bad "dbus-run-session not installed (apt install dbus-daemon): the bus-without-a-Secret-Service case, GitHub's runner condition, cannot run"; fi
 fi
 
 # (f) ------------------------------------------------------------------------

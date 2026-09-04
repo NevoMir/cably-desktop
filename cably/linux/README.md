@@ -80,9 +80,17 @@ counterparts.
 - Secret store (`cably/src/cably_bridge_keychain.cpp`, non-Apple half): the Cably session
   goes to the freedesktop Secret Service through libsecret when one answers on the session
   bus, else to `$XDG_CONFIG_HOME/cably-desktop/session.json` (0600 in a 0700 directory,
-  written temp-then-rename). A reachable service that fails is an error, never a silent
-  fallback. Unit test: `cably/tests/unit/test_cably_secret_store.cpp` (a fake service
-  behind the `CABLY_SECRET_SERVICE` seam); CLI round-trip: `cably/tests/bridge.sh` (e).
+  written temp-then-rename). "Answers" is probed (a libsecret `OpenSession` under a
+  watchdog, `CABLY_SECRET_SERVICE_TIMEOUT_MS`, default 5000): no session bus, a bus nobody
+  listens on, a bus without a keyring (GitHub's ubuntu runners: "The name
+  org.freedesktop.secrets was not provided by any .service files"), a bus that never
+  replies, or a D-Bus error in the middle of a lookup/store/clear all mean the file is
+  used, with no error and `Note()` / the CLI's `store_note=` saying why; a service that
+  answers is always preferred and the next save moves a file-held session into it. Unit
+  test: `cably/tests/unit/test_cably_secret_store.cpp` (a fake service behind the
+  `CABLY_SECRET_SERVICE` seam, plus the real libsecret backend re-run in child processes
+  on a dead bus address, a listening-but-silent socket and a `dbus-run-session` bus with
+  no keyring); CLI round-trip under the same bus conditions: `cably/tests/bridge.sh` (e).
 - The package installs under `/opt/cably-desktop` and never owns a path a distribution
   `kicad` package ships (no `kicad-*.xml` MIME files or `application-x-kicad-*` icons
   under `/usr/share`), so both can be installed side by side.

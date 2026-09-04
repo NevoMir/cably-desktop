@@ -118,6 +118,9 @@ if [ -f "$BUILD/CMakeCache.txt" ]; then
     sed 's/^/     /' "$T/bridge.log"; ok "bridge.sh: PASS ($(grep -c '^  ok' "$T/bridge.log") checks)"
   else sed 's/^/     /' "$T/bridge.log"; bad "bridge.sh: FAIL ($(grep -c '^  FAIL' "$T/bridge.log") failing checks, see above)"; fi
   grep -q "^  ok   secret store: save -> show round-trips" "$T/bridge.log" && ok "bridge.sh exercised the Linux secret store ($(sed -n 's/^  ok   secret store: .*(store_backend=\(.*\))$/\1/p' "$T/bridge.log" | head -1))" || bad "bridge.sh did not run the secret store round-trip"
+  # GitHub's ubuntu runners have a session bus and no Secret Service on it; bridge.sh
+  # (e) recreates that with dbus-run-session (package dbus-daemon) and must have run it.
+  grep -q "^  ok   secret store (bus without a Secret Service): save -> show round-trips" "$T/bridge.log" && ok "bridge.sh exercised the bus-without-a-Secret-Service case (the GitHub runner condition)" || bad "bridge.sh did not run the bus-without-a-Secret-Service secret store case (dbus-run-session missing?)"
 else bad "no configured build at $BUILD (CMakeCache.txt missing): run cably/linux/build.sh first"; fi
 
 # (3) ----------------------------------------------------------------------------

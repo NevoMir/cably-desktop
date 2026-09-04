@@ -159,8 +159,15 @@ class CABLY_SECRET_SERVICE
 {
 public:
     virtual ~CABLY_SECRET_SERVICE() = default;
-    /// A Secret Service is reachable on the session bus right now.
-    virtual bool Available() = 0;
+
+    /**
+     * A Secret Service answers on the session bus right now (the probe is bounded: a bus
+     * that never replies counts as unavailable).  On false, aReason says why - empty when
+     * the machine simply has no session bus, else the D-Bus/libsecret error (a bus nobody
+     * listens on, "The name org.freedesktop.secrets was not provided by any .service
+     * files" on a bus without a keyring, a timeout ...).
+     */
+    virtual bool Available( std::string& aReason ) = 0;
     virtual bool Lookup( const std::string& aService, std::string& aJson, std::string& aError ) = 0;
     virtual bool Store( const std::string& aService, const std::string& aJson, std::string& aError ) = 0;
     virtual bool Clear( const std::string& aService, std::string& aError ) = 0;
@@ -173,14 +180,18 @@ public:
  * macOS: one generic-password item, service = aService (CABLY_KEYCHAIN_SERVICE),
  * account "session", data = CablySessionToJson().
  *
- * Linux (and other Unix): the Secret Service through libsecret when one is reachable
- * (schema dev.cably.desktop, attributes service=aService, account="session", in the
- * default collection), else - documented fallback - the file
+ * Linux (and other Unix): the Secret Service through libsecret when one answers (schema
+ * dev.cably.desktop, attributes service=aService, account="session", in the default
+ * collection), else - documented fallback - the file
  * $XDG_CONFIG_HOME/cably-desktop/session.json (session.<service>.json for any other
  * service name; $HOME/.config when XDG_CONFIG_HOME is unset or relative), mode 0600 in a 0700
- * directory, written temp-then-rename.  Load() also finds the file when the service is
- * back and the next Save() moves the session into it (the file is removed).  A reachable
- * service that fails is an error, never a silent fallback.  Backend() says which was used.
+ * directory, written temp-then-rename.  The file is used whenever the service cannot be
+ * used for ANY reason - no session bus, a bus nobody listens on, a bus without a keyring
+ * (GitHub's runners), or a D-Bus error in the middle of a lookup/store/clear - with
+ * LastError() empty and Note() saying why; a service that answers is always preferred,
+ * and Load() also finds the file when the service is back so the next Save() moves the
+ * session into it (the file is removed).  Only a stored item that is not a session is an
+ * error.  Backend() says which was used.
  *
  * Windows: every call fails with LastError() "no secret store on this platform"
  * (Credential Manager is TODO; see CHANGES.md).
@@ -206,15 +217,26 @@ public:
     /// What the last operation used: "keychain" (macOS), "secret-service" or "file:<path>".
     std::string Backend() const { return m_backend; }
 
+    /**
+     * Linux: why the last operation did not use the Secret Service (it was unreachable,
+     * or a call to it failed and the file was used instead); empty when it was used, when
+     * the machine has no session bus at all, or on macOS.
+     */
+    std::string Note() const { return m_note; }
+
     /// Linux: $XDG_CONFIG_HOME/cably-desktop, else $HOME/.config/cably-desktop.
     static std::string DefaultFallbackDir();
     /// Linux: aDir/session.json for the default service name, aDir/session.<service>.json else.
     static std::string FallbackPath( const std::string& aDir, const std::string& aService );
 
 private:
+    /// Linux: the service is worth talking to (probed); on false, m_note carries the reason.
+    bool serviceAnswers();
+
     std::string           m_service;
     std::string           m_error;
     std::string           m_backend;
+    std::string           m_note;
     std::string           m_fallbackDir;
     CABLY_SECRET_SERVICE* m_secretService = nullptr;
 };
