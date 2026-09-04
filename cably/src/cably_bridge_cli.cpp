@@ -55,6 +55,8 @@
  *                print watching=, one `event ...` line per save, events=, exit=
  *                (exit 3 when the timeout passed with no event)
  *   save         store the seeded session;  show  print the stored session;  signout  clear it
+ *                (all three print store_backend= for --store keychain: keychain,
+ *                secret-service or file:<path>)
  */
 
 // kicad_curl headers must precede any wxWidgets header.
@@ -222,6 +224,14 @@ int main( int argc, char** argv )
     CABLY_HTTP_KICAD http;
     CABLY_BRIDGE     bridge( http, *store, config );
     bridge.LoadSession();
+
+    // save/show/signout: which persistent store the platform used (bridge.sh asserts the
+    // Linux fallback file on a machine without a Secret Service).
+    auto printStoreBackend = [&]()
+    {
+        if( auto* kc = dynamic_cast<CABLY_KEYCHAIN_SECRET_STORE*>( store.get() ) )
+            std::printf( "store_backend=%s\n", kc->Backend().c_str() );
+    };
 
     int rc = 0;
 
@@ -488,6 +498,8 @@ int main( int argc, char** argv )
     {
         if( !haveSeed )
             return usage();
+
+        printStoreBackend();
     }
     else if( command == "show" )
     {
@@ -496,6 +508,7 @@ int main( int argc, char** argv )
             std::printf( "email=%s\naccess_token_len=%zu\nrefresh_token_len=%zu\nexpires_at=%lld\n",
                          bridge.Session().email.c_str(), bridge.Session().accessToken.size(),
                          bridge.Session().refreshToken.size(), bridge.Session().expiresAt );
+            printStoreBackend();
         }
         else
         {
@@ -509,6 +522,10 @@ int main( int argc, char** argv )
         {
             std::fprintf( stderr, "%s\n", store->LastError().c_str() );
             rc = 1;
+        }
+        else
+        {
+            printStoreBackend();
         }
     }
     else

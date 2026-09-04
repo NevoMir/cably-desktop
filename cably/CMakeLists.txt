@@ -109,3 +109,21 @@ target_sources( kicad PRIVATE
     )
 target_sources( cably-bridge-cli PRIVATE ${CMAKE_CURRENT_LIST_DIR}/src/cably_sync.cpp )
 # ---- end F5 sync-bridge ----
+
+# ---- Linux port (agent "linux-port") ----
+# cably_bridge_keychain.cpp's non-Apple half: libsecret (Secret Service) with the 0600
+# file fallback.  KiCad's own kiplatform already requires libsecret-1 on Linux, so the
+# dependency is not new; CABLY_HAVE_LIBSECRET=1 turns the libsecret backend on (without
+# it the file is the only store).  Unit test: cably/tests/unit/test_cably_secret_store.cpp,
+# built standalone by cably/linux/run-tests.sh and cably/tests/bridge.sh.
+if( UNIX AND NOT APPLE )
+    find_package( PkgConfig REQUIRED )
+    pkg_check_modules( CABLY_LIBSECRET REQUIRED libsecret-1 )
+    foreach( _cably_target kicad cably-bridge-cli )
+        target_include_directories( ${_cably_target} SYSTEM PRIVATE ${CABLY_LIBSECRET_INCLUDE_DIRS} )
+        target_compile_definitions( ${_cably_target} PRIVATE CABLY_HAVE_LIBSECRET=1 )
+        target_link_libraries( ${_cably_target} ${CABLY_LIBSECRET_LIBRARIES} )
+    endforeach()
+
+endif()
+# ---- end Linux port ----

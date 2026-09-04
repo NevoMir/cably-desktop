@@ -107,8 +107,13 @@ if [ -f "$INNER/CMakeCache.txt" ]; then
   if pgrep -f "build.py|/ninja|[c]make --build" >/dev/null; then
     bad "another build is running; refusing to touch $INNER (the Mac freezes on two builds)"
   else
-    # A target added since the last configure is unknown to the Makefile until CMake re-runs.
-    if make -C "$INNER" cmake_check_build_system >"$T/make.log" 2>&1 && make -C "$INNER" -j"$JOBS" cably-bridge-cli >>"$T/make.log" 2>&1; then
+    # A target added since the last configure is unknown to the Makefile until CMake re-runs
+    # (a Ninja tree — the Linux build, cably/linux/build.sh — re-runs CMake by itself).
+    build_cli(){
+      if [ -f "$INNER/build.ninja" ]; then ninja -C "$INNER" -j"$JOBS" cably-bridge-cli
+      else make -C "$INNER" cmake_check_build_system && make -C "$INNER" -j"$JOBS" cably-bridge-cli; fi
+    }
+    if build_cli >"$T/make.log" 2>&1; then
       CLI="$INNER/cably/cably-bridge-cli"
       [ -x "$CLI" ] && ok "cably-bridge-cli built: $CLI" || { bad "make succeeded but $CLI missing"; CLI=""; }
     else bad "cably-bridge-cli did not build:"; grep -E "error|Error" "$T/make.log" | head -20 | sed 's/^/       /'; fi
@@ -233,6 +238,35 @@ if [ "$(uname)" = Darwin ]; then
   else
     grep -q "errSecInteractionNotAllowed\|-25308" "$T/kc1" && echo "  skip keychain (locked / no UI session): $(cat "$T/kc1")" || bad "keychain: save failed: $(cat "$T/kc1")"
   fi
+else
+  # Linux: the same store is libsecret when a Secret Service answers on the session bus,
+  # else the 0600 file under $XDG_CONFIG_HOME/cably-desktop (cably_bridge_keychain.cpp).
+  # Pointing XDG_CONFIG_HOME at a scratch dir keeps the test off the real config; without
+  # a session bus (container, CI, ssh) the file is the backend and the CLI says so.
+  SVC="dev.cably.desktop.test.$$"
+  KC=(--store keychain --keychain-service "$SVC")
+  export XDG_CONFIG_HOME="$T/xdg"
+  SESSION_FILE="$XDG_CONFIG_HOME/cably-desktop/session.$SVC.json"
+  "$CLI" "${KC[@]}" --token kc-token --refresh-token kc-refresh --email kc@example.com --expires-at 4102444800 save >"$T/kc1" 2>&1; rc=$?
+  if [ $rc = 0 ]; then
+    BACKEND=$(sed -n 's/^store_backend=//p' "$T/kc1")
+    case "$BACKEND" in
+      secret-service) ok "secret store: Secret Service reachable, item stored there (store_backend=$BACKEND)" ;;
+      "file:$SESSION_FILE")
+        ok "secret store: no Secret Service, fallback file used (store_backend=$BACKEND)"
+        [ "$(stat -c %a "$SESSION_FILE")" = 600 ] && ok "secret store: session file mode 0600" || bad "secret store: session file mode $(stat -c %a "$SESSION_FILE") (want 600)"
+        [ "$(stat -c %a "$XDG_CONFIG_HOME/cably-desktop")" = 700 ] && ok "secret store: cably-desktop dir mode 0700" || bad "secret store: dir mode $(stat -c %a "$XDG_CONFIG_HOME/cably-desktop") (want 700)"
+        grep -q "kc-token" "$SESSION_FILE" && ok "secret store: the file holds the session (tokens never printed by the CLI)" || bad "secret store: session file does not hold the token" ;;
+      *) bad "secret store: unexpected store_backend='$BACKEND' (want secret-service or file:$SESSION_FILE)" ;;
+    esac
+    OUT=$("$CLI" "${KC[@]}" show 2>&1)
+    echo "$OUT" | grep -q "email=kc@example.com" && echo "$OUT" | grep -q "access_token_len=8" && echo "$OUT" | grep -q "expires_at=4102444800" && ok "secret store: save -> show round-trips" || bad "secret store: show: $OUT"
+    echo "$OUT" | grep -q "^store_backend=$BACKEND$" && ok "secret store: show read the same backend" || bad "secret store: show backend differs: $(echo "$OUT" | grep store_backend)"
+    "$CLI" "${KC[@]}" signout >/dev/null 2>&1 && ok "secret store: signout" || bad "secret store: signout failed"
+    "$CLI" "${KC[@]}" show >/dev/null 2>&1 && bad "secret store: session survived signout" || ok "secret store: session gone after signout"
+    [ -e "$SESSION_FILE" ] && bad "secret store: $SESSION_FILE still exists after signout" || ok "secret store: no session file left after signout"
+  else bad "secret store: save failed on $(uname): $(cat "$T/kc1")"; fi
+  unset XDG_CONFIG_HOME
 fi
 
 # (f) ------------------------------------------------------------------------

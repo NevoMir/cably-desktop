@@ -31,7 +31,9 @@
  *                         CLI; tests inject a recording fake.
  *  - CABLY_SECRET_STORE   where the session lives.  CABLY_KEYCHAIN_SECRET_STORE
  *                         (cably_bridge_keychain.cpp) is the macOS Security.framework
- *                         implementation; CABLY_MEMORY_SECRET_STORE is for tests/CLI.
+ *                         implementation, and on Linux libsecret with a 0600 file as the
+ *                         fallback (CABLY_SECRET_SERVICE is its test seam);
+ *                         CABLY_MEMORY_SECRET_STORE is for tests/CLI.
  *
  * Sign-in is a loopback handoff: CABLY_LOOPBACK_SERVER listens on 127.0.0.1:<random>,
  * the system browser opens CABLY_DESKTOP_AUTH_URL?port=P&state=S, the web page performs
@@ -148,23 +150,73 @@ private:
 
 
 /**
+ * Linux: the Secret Service (libsecret) half of CABLY_KEYCHAIN_SECRET_STORE behind an
+ * interface, so the unit test (cably/tests/unit/test_cably_secret_store.cpp) can stand in
+ * a fake for the keyring that the container and CI do not have.  Lookup() returns false
+ * with an EMPTY aError when there is simply no item.
+ */
+class CABLY_SECRET_SERVICE
+{
+public:
+    virtual ~CABLY_SECRET_SERVICE() = default;
+    /// A Secret Service is reachable on the session bus right now.
+    virtual bool Available() = 0;
+    virtual bool Lookup( const std::string& aService, std::string& aJson, std::string& aError ) = 0;
+    virtual bool Store( const std::string& aService, const std::string& aJson, std::string& aError ) = 0;
+    virtual bool Clear( const std::string& aService, std::string& aError ) = 0;
+};
+
+
+/**
+ * The persistent session store.
+ *
  * macOS: one generic-password item, service = aService (CABLY_KEYCHAIN_SERVICE),
- * account "session", data = CablySessionToJson().  Other platforms: every call fails
- * with LastError() "no secret store on this platform" (Windows Credential Manager and
- * libsecret are TODO; see CHANGES.md).
+ * account "session", data = CablySessionToJson().
+ *
+ * Linux (and other Unix): the Secret Service through libsecret when one is reachable
+ * (schema dev.cably.desktop, attributes service=aService, account="session", in the
+ * default collection), else - documented fallback - the file
+ * $XDG_CONFIG_HOME/cably-desktop/session.json (session.<service>.json for any other
+ * service name; $HOME/.config when XDG_CONFIG_HOME is unset or relative), mode 0600 in a 0700
+ * directory, written temp-then-rename.  Load() also finds the file when the service is
+ * back and the next Save() moves the session into it (the file is removed).  A reachable
+ * service that fails is an error, never a silent fallback.  Backend() says which was used.
+ *
+ * Windows: every call fails with LastError() "no secret store on this platform"
+ * (Credential Manager is TODO; see CHANGES.md).
  */
 class CABLY_KEYCHAIN_SECRET_STORE : public CABLY_SECRET_STORE
 {
 public:
     explicit CABLY_KEYCHAIN_SECRET_STORE( const std::string& aService );
+
+    /**
+     * Linux test seam.  aBackend nullptr = the platform's libsecret backend (none when
+     * built without CABLY_HAVE_LIBSECRET); aFallbackDir empty = DefaultFallbackDir().
+     * On macOS both are ignored (the keychain is always used).
+     */
+    CABLY_KEYCHAIN_SECRET_STORE( const std::string& aService, CABLY_SECRET_SERVICE* aBackend,
+                                 const std::string& aFallbackDir );
+
     bool        Load( CABLY_SESSION& aOut ) override;
     bool        Save( const CABLY_SESSION& aSession ) override;
     bool        Clear() override;
     std::string LastError() const override { return m_error; }
 
+    /// What the last operation used: "keychain" (macOS), "secret-service" or "file:<path>".
+    std::string Backend() const { return m_backend; }
+
+    /// Linux: $XDG_CONFIG_HOME/cably-desktop, else $HOME/.config/cably-desktop.
+    static std::string DefaultFallbackDir();
+    /// Linux: aDir/session.json for the default service name, aDir/session.<service>.json else.
+    static std::string FallbackPath( const std::string& aDir, const std::string& aService );
+
 private:
-    std::string m_service;
-    std::string m_error;
+    std::string           m_service;
+    std::string           m_error;
+    std::string           m_backend;
+    std::string           m_fallbackDir;
+    CABLY_SECRET_SERVICE* m_secretService = nullptr;
 };
 
 

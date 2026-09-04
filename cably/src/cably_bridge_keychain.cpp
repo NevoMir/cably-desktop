@@ -26,8 +26,17 @@
  * API - no Objective-C, plain CoreFoundation from C++.  Link: -framework Security
  * -framework CoreFoundation (see cably/CMakeLists.txt).
  *
- * Windows (Credential Manager) and Linux (libsecret) are NOT implemented yet: every
- * call fails with LastError() set, so the app falls back to signing in each launch.
+ * Linux (and other Unix): libsecret (the freedesktop Secret Service: GNOME Keyring,
+ * KWallet's bridge, KeePassXC ...) when a service is reachable on the session bus, with
+ * schema "dev.cably.desktop" {service, account="session"} in the default collection;
+ * otherwise the documented fallback file $XDG_CONFIG_HOME/cably-desktop/session.json
+ * (0600, directory 0700, temp-then-rename).  The libsecret half sits behind
+ * CABLY_SECRET_SERVICE so cably/tests/unit/test_cably_secret_store.cpp drives the store
+ * with a fake keyring; built with -DCABLY_HAVE_LIBSECRET=1 + `pkg-config libsecret-1`
+ * (cably/CMakeLists.txt does that for the app and the CLI).
+ *
+ * Windows (Credential Manager) is NOT implemented yet: every call fails with LastError()
+ * set, so the app falls back to signing in each launch.
  */
 
 #include <cably_bridge.h>
@@ -103,8 +112,30 @@ CFMutableDictionaryRef baseQuery( const std::string& aService )
 
 
 CABLY_KEYCHAIN_SECRET_STORE::CABLY_KEYCHAIN_SECRET_STORE( const std::string& aService ) :
-        m_service( aService )
+        m_service( aService ),
+        m_backend( "keychain" )
 {
+}
+
+
+CABLY_KEYCHAIN_SECRET_STORE::CABLY_KEYCHAIN_SECRET_STORE( const std::string& aService,
+                                                          CABLY_SECRET_SERVICE*,
+                                                          const std::string& ) :
+        m_service( aService ),
+        m_backend( "keychain" )
+{
+}
+
+
+std::string CABLY_KEYCHAIN_SECRET_STORE::DefaultFallbackDir()
+{
+    return std::string(); // the keychain never falls back to a file on macOS
+}
+
+
+std::string CABLY_KEYCHAIN_SECRET_STORE::FallbackPath( const std::string&, const std::string& )
+{
+    return std::string();
 }
 
 
@@ -199,33 +230,426 @@ bool CABLY_KEYCHAIN_SECRET_STORE::Clear()
     return false;
 }
 
-#else // not __APPLE__
+#else // not __APPLE__: Linux and other Unix
+
+#include <cably_config.h>
+
+#include <cerrno>
+#include <cstdlib>
+#include <cstring>
+#include <fstream>
+
+#include <fcntl.h>
+#include <sys/stat.h>
+#include <unistd.h>
+
+#if CABLY_HAVE_LIBSECRET
+#include <libsecret/secret.h>
+#endif
+
+namespace
+{
+
+#if CABLY_HAVE_LIBSECRET
+
+const SecretSchema* cablySchema()
+{
+    static const SecretSchema schema = {
+        "dev.cably.desktop",
+        SECRET_SCHEMA_NONE,
+        {
+            { "service", SECRET_SCHEMA_ATTRIBUTE_STRING },
+            { "account", SECRET_SCHEMA_ATTRIBUTE_STRING },
+            { nullptr, SECRET_SCHEMA_ATTRIBUTE_STRING },
+        }
+    };
+    return &schema;
+}
+
+
+std::string takeError( GError*& aError, const char* aWhat )
+{
+    std::string out = std::string( aWhat ) + ": " + ( aError && aError->message ? aError->message : "unknown error" );
+
+    if( aError )
+        g_error_free( aError );
+
+    aError = nullptr;
+    return out;
+}
+
+
+/// libsecret against the session bus.
+class LIBSECRET_SERVICE : public CABLY_SECRET_SERVICE
+{
+public:
+    bool Available() override
+    {
+        // With no session bus at all (containers, CI, ssh) GDBus would try to autolaunch
+        // one through X11, which blocks under Xvfb; the fallback file is the answer there.
+        const char* addr = std::getenv( "DBUS_SESSION_BUS_ADDRESS" );
+
+        if( !addr || !*addr )
+        {
+            const char* runtime = std::getenv( "XDG_RUNTIME_DIR" );
+            struct stat st;
+
+            if( !runtime || !*runtime || ::stat( ( std::string( runtime ) + "/bus" ).c_str(), &st ) != 0 )
+                return false;
+        }
+
+        GError*        error = nullptr;
+        SecretService* service = secret_service_get_sync( SECRET_SERVICE_NONE, nullptr, &error );
+
+        if( error )
+        {
+            g_error_free( error );
+            return false;
+        }
+
+        if( !service )
+            return false;
+
+        g_object_unref( service );
+        return true;
+    }
+
+    bool Lookup( const std::string& aService, std::string& aJson, std::string& aError ) override
+    {
+        aError.clear();
+        GError* error = nullptr;
+        gchar*  secret = secret_password_lookup_sync( cablySchema(), nullptr, &error, "service",
+                                                      aService.c_str(), "account", "session", nullptr );
+
+        if( error )
+        {
+            aError = takeError( error, "secret service lookup" );
+            return false;
+        }
+
+        if( !secret )
+            return false;
+
+        aJson = secret;
+        secret_password_free( secret );
+        return true;
+    }
+
+    bool Store( const std::string& aService, const std::string& aJson, std::string& aError ) override
+    {
+        aError.clear();
+        GError* error = nullptr;
+        secret_password_store_sync( cablySchema(), SECRET_COLLECTION_DEFAULT, "Cably Desktop session",
+                                    aJson.c_str(), nullptr, &error, "service", aService.c_str(), "account",
+                                    "session", nullptr );
+
+        if( error )
+        {
+            aError = takeError( error, "secret service store" );
+            return false;
+        }
+
+        return true;
+    }
+
+    bool Clear( const std::string& aService, std::string& aError ) override
+    {
+        aError.clear();
+        GError* error = nullptr;
+        secret_password_clear_sync( cablySchema(), nullptr, &error, "service", aService.c_str(), "account",
+                                    "session", nullptr );
+
+        if( error )
+        {
+            aError = takeError( error, "secret service clear" );
+            return false;
+        }
+
+        return true;
+    }
+};
+
+
+CABLY_SECRET_SERVICE* platformSecretService()
+{
+    static LIBSECRET_SERVICE service;
+    return &service;
+}
+
+#else
+
+CABLY_SECRET_SERVICE* platformSecretService()
+{
+    return nullptr; // built without libsecret: the file is the only store
+}
+
+#endif // CABLY_HAVE_LIBSECRET
+
+
+std::string errnoText( const char* aWhat, const std::string& aPath )
+{
+    return std::string( aWhat ) + " " + aPath + ": " + std::strerror( errno );
+}
+
+
+/// mkdir -p with mode 0700 for every component we create; the leaf is forced to 0700.
+bool ensureDir0700( const std::string& aDir, std::string& aError )
+{
+    std::string path;
+
+    for( size_t i = 0; i <= aDir.size(); ++i )
+    {
+        if( i < aDir.size() && aDir[i] != '/' )
+            continue;
+
+        path = aDir.substr( 0, i );
+
+        if( path.empty() )
+            continue;
+
+        struct stat st;
+
+        if( ::stat( path.c_str(), &st ) == 0 )
+        {
+            if( !S_ISDIR( st.st_mode ) )
+            {
+                aError = "not a directory: " + path;
+                return false;
+            }
+
+            continue;
+        }
+
+        if( ::mkdir( path.c_str(), 0700 ) != 0 && errno != EEXIST )
+        {
+            aError = errnoText( "cannot create", path );
+            return false;
+        }
+    }
+
+    if( ::chmod( aDir.c_str(), 0700 ) != 0 )
+    {
+        aError = errnoText( "cannot chmod 0700", aDir );
+        return false;
+    }
+
+    return true;
+}
+
+
+bool writeFile0600( const std::string& aPath, const std::string& aText, std::string& aError )
+{
+    const std::string tmp = aPath + ".tmp";
+    int fd = ::open( tmp.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600 );
+
+    if( fd < 0 )
+    {
+        aError = errnoText( "cannot create", tmp );
+        return false;
+    }
+
+    // The umask may have widened the mode above; the file holds tokens, so force it.
+    if( ::fchmod( fd, 0600 ) != 0 )
+    {
+        aError = errnoText( "cannot chmod 0600", tmp );
+        ::close( fd );
+        ::unlink( tmp.c_str() );
+        return false;
+    }
+
+    size_t done = 0;
+
+    while( done < aText.size() )
+    {
+        ssize_t n = ::write( fd, aText.data() + done, aText.size() - done );
+
+        if( n < 0 )
+        {
+            if( errno == EINTR )
+                continue;
+
+            aError = errnoText( "cannot write", tmp );
+            ::close( fd );
+            ::unlink( tmp.c_str() );
+            return false;
+        }
+
+        done += static_cast<size_t>( n );
+    }
+
+    ::fsync( fd );
+    ::close( fd );
+
+    if( ::rename( tmp.c_str(), aPath.c_str() ) != 0 )
+    {
+        aError = errnoText( "cannot rename into place", aPath );
+        ::unlink( tmp.c_str() );
+        return false;
+    }
+
+    return true;
+}
+
+} // namespace
+
+
+std::string CABLY_KEYCHAIN_SECRET_STORE::DefaultFallbackDir()
+{
+    const char* xdg = std::getenv( "XDG_CONFIG_HOME" );
+
+    // The XDG base directory spec: a relative XDG_CONFIG_HOME is invalid and ignored.
+    if( xdg && xdg[0] == '/' )
+        return std::string( xdg ) + "/cably-desktop";
+
+    const char* home = std::getenv( "HOME" );
+    return std::string( home && *home ? home : "." ) + "/.config/cably-desktop";
+}
+
+
+std::string CABLY_KEYCHAIN_SECRET_STORE::FallbackPath( const std::string& aDir, const std::string& aService )
+{
+    std::string dir = aDir;
+
+    while( dir.size() > 1 && dir.back() == '/' )
+        dir.pop_back();
+
+    if( aService == CABLY_KEYCHAIN_SERVICE )
+        return dir + "/session.json";
+
+    return dir + "/session." + aService + ".json";
+}
+
 
 CABLY_KEYCHAIN_SECRET_STORE::CABLY_KEYCHAIN_SECRET_STORE( const std::string& aService ) :
+        CABLY_KEYCHAIN_SECRET_STORE( aService, nullptr, std::string() )
+{
+}
+
+
+CABLY_KEYCHAIN_SECRET_STORE::CABLY_KEYCHAIN_SECRET_STORE( const std::string& aService,
+                                                          CABLY_SECRET_SERVICE* aBackend,
+                                                          const std::string& aFallbackDir ) :
         m_service( aService ),
-        m_error( "no secret store on this platform" )
+        m_fallbackDir( aFallbackDir.empty() ? DefaultFallbackDir() : aFallbackDir ),
+        m_secretService( aBackend ? aBackend : platformSecretService() )
 {
 }
 
 
-bool CABLY_KEYCHAIN_SECRET_STORE::Load( CABLY_SESSION& )
+bool CABLY_KEYCHAIN_SECRET_STORE::Load( CABLY_SESSION& aOut )
 {
-    m_error = "no secret store on this platform";
-    return false;
+    m_error.clear();
+
+    if( m_secretService && m_secretService->Available() )
+    {
+        std::string json, err;
+
+        if( m_secretService->Lookup( m_service, json, err ) )
+        {
+            m_backend = "secret-service";
+
+            if( !CablySessionFromJson( json, aOut ) )
+            {
+                m_error = "secret service item is not a session";
+                return false;
+            }
+
+            return true;
+        }
+
+        if( !err.empty() )
+        {
+            m_backend = "secret-service";
+            m_error = "secret service read failed: " + err;
+            return false;
+        }
+
+        // No item: a session saved while the service was away may be in the file.
+    }
+
+    const std::string path = FallbackPath( m_fallbackDir, m_service );
+    m_backend = "file:" + path;
+
+    std::ifstream in( path, std::ios::binary );
+
+    if( !in )
+        return false; // nothing stored
+
+    std::string json( ( std::istreambuf_iterator<char>( in ) ), std::istreambuf_iterator<char>() );
+
+    if( !CablySessionFromJson( json, aOut ) )
+    {
+        m_error = "session file is not a session: " + path;
+        return false;
+    }
+
+    return true;
 }
 
 
-bool CABLY_KEYCHAIN_SECRET_STORE::Save( const CABLY_SESSION& )
+bool CABLY_KEYCHAIN_SECRET_STORE::Save( const CABLY_SESSION& aSession )
 {
-    m_error = "no secret store on this platform";
-    return false;
+    m_error.clear();
+    const std::string json = CablySessionToJson( aSession );
+    const std::string path = FallbackPath( m_fallbackDir, m_service );
+
+    if( m_secretService && m_secretService->Available() )
+    {
+        m_backend = "secret-service";
+        std::string err;
+
+        if( !m_secretService->Store( m_service, json, err ) )
+        {
+            m_error = "secret service write failed: " + err;
+            return false;
+        }
+
+        ::unlink( path.c_str() ); // migrate: nothing left on disk once the keyring has it
+        return true;
+    }
+
+    m_backend = "file:" + path;
+    std::string err;
+
+    if( !ensureDir0700( m_fallbackDir, err ) || !writeFile0600( path, json, err ) )
+    {
+        m_error = "session file write failed: " + err;
+        return false;
+    }
+
+    return true;
 }
 
 
 bool CABLY_KEYCHAIN_SECRET_STORE::Clear()
 {
-    m_error = "no secret store on this platform";
-    return false;
+    m_error.clear();
+    const std::string path = FallbackPath( m_fallbackDir, m_service );
+    bool              ok = true;
+
+    if( m_secretService && m_secretService->Available() )
+    {
+        m_backend = "secret-service";
+        std::string err;
+
+        if( !m_secretService->Clear( m_service, err ) )
+        {
+            m_error = "secret service delete failed: " + err;
+            ok = false;
+        }
+    }
+    else
+    {
+        m_backend = "file:" + path;
+    }
+
+    if( ::unlink( path.c_str() ) != 0 && errno != ENOENT )
+    {
+        m_error = "session file delete failed: " + errnoText( "cannot remove", path );
+        ok = false;
+    }
+
+    return ok;
 }
 
 #endif
