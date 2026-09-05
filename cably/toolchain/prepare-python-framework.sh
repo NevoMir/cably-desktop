@@ -39,6 +39,8 @@ ditto --arch "$ARCH" "$PAYLOAD" "$DEST/Python.framework"  # thin: 113 MB univers
 FW="$DEST/Python.framework"; V="$FW/Versions/$XY"
 OLD="/Library/Frameworks/Python.framework/Versions/$XY"
 rm -f "$V/bin/python$XY-intel64"                        # x86_64-only launcher, gone after thinning
+rm -f "$V/bin/python3-intel64"                           # its symlink: dangling, and codesign seals it ->
+                                                        # every later verify of the framework fails (2026-09-05)
 rm -rf "$V/_CodeSignature" "$V/Resources/Python.app/Contents/_CodeSignature"
 # Current must exist for KiCad's PYTHONHOME (RefixupMacOS.cmake:82-84 recreates it anyway)
 ln -sfn "$XY" "$FW/Versions/Current"

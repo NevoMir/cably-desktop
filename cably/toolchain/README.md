@@ -102,8 +102,86 @@ step; identity org.cably.desktop / "Cably Desktop", symbol + footprint libraries
 `Applications` symlink, and the folder `Cably Desktop/` holding the six editor
 launcher symlinks re-pointed to `../Cably Desktop.app/Contents/Applications/<x>.app`
 plus `demos/`. Nothing in the image is named KiCad.app.
-Still to do: Developer ID signing + notarization (the ad-hoc sign step is
-tolerated); 3D models as a separate package.
+Still to do: 3D models as a separate package. Signing + notarization: next section.
+
+## Developer ID signing, notarization, stapling (F6, 2026-09-05)
+
+Model: KiCad's own signed+notarized 10.0.1 DMG (every code object Developer ID,
+hardened runtime, secure timestamp, the four entitlements of
+`signing/entitlements.plist`; the image signed, notarized and stapled).
+Acceptance: `cably/tests/signed.sh [file.dmg]` (six sections; PASSes on KiCad's
+DMG as the positive control, see its header). Two scripts in this directory do
+the work, both strict (`set -e`, any codesign/notarytool failure is fatal), GPL:
+
+- `sign-macos.sh <KiCad.app> [identity]` — seal hygiene, then codesign inside-out.
+  Hygiene first because the embedded python.org framework breaks its own seal
+  twice: the DANGLING `Versions/3.12/bin/python3-intel64` symlink (the x86_64
+  launcher was thinned away; `prepare-python-framework.sh` now removes the link
+  too) makes every verify fail with "No such file or directory", and any run of
+  the bundled Python writes `__pycache__/*.pyc` into the sealed framework ("a
+  sealed resource is missing or invalid" — the official KiCad.app in
+  /Applications fails `--deep --strict` for exactly this reason once launched).
+  So: dangling links removed, `__pycache__` stripped, the stdlib byte-compiled
+  with `--invalidation-mode checked-hash` (1807 .pyc, 3 s; valid regardless of
+  mtime, Python writes nothing afterwards); stale `*.cstemp` files (codesign's
+  own temp file, left behind when a signing run is killed — a Mach-O too, and
+  gone by the time the batch reaches it) are deleted. Then every Mach-O regular file (by
+  magic, ~290) → `Python.app` → `Python.framework/Versions/3.12` (the root
+  resolves to it) → the six editor apps → the app, each with
+  `codesign --force --sign <id> --options runtime --timestamp --entitlements
+  entitlements.plist` (the copy here is byte-identical to kicad-mac-builder's),
+  then `codesign --verify --deep --strict`. Measured 96 s (hygiene + listing
+  40 s, 290 Mach-O 53 s, bundles 4 s). The secure timestamp comes from
+  `http://timestamp.apple.com/ts01` (port 80): on a network where port 443 of
+  that host is refused, `--timestamp` still works — measure with a probe file
+  before blaming the network. Why not the toolchain's `bin/apple.py`: it skips Python.framework, never
+  passes `--timestamp`, and the fork's install-step signer can only sign ad-hoc
+  (`CMakeLists.txt` FORCEs `KICAD_OSX_SIGNING_ID "-"`). Never launch the app or
+  run its Python from `kicad-dest` after signing — verify on the DMG mount.
+- `notarize.sh <KiCad.app|file.dmg> [--no-staple]` — `xcrun notarytool submit`
+  with the stored keychain profile `$CABLY_NOTARY_PROFILE` (default `cably-app`,
+  created ONCE interactively with `xcrun notarytool store-credentials cably-app`;
+  no password ever passes through the scripts), WITHOUT `--wait`: prints the
+  submission id, polls `notarytool info` every 120 s (`CABLY_NOTARY_POLL`), on
+  Invalid prints `notarytool log`, on Accepted `stapler staple` + `validate`.
+  An .app is zipped with `ditto -c -k --keepParent` for the upload and the ticket
+  is stapled to the app itself (Apple's advice for an app inside a DMG, so a
+  copy dragged out opens offline; KiCad staples only its DMG).
+
+Patch hunks: `kicad.cmake` — `sign-app` runs `sign-macos.sh` (STRICT) when
+`SIGNING_CERTIFICATE_ID` is not `-`, the tolerant apple.py ad-hoc pass only for
+dev builds; a `notarize-app` step (notarize.sh, stapled) when the cache var
+`CABLY_NOTARY_PROFILE` is non-empty. `bin/package.sh` — the DMG is signed with
+`--timestamp` and, with the profile, notarized + stapled by notarize.sh.
+`package_kicad_unified.cmake` passes the profile through. The altool-era
+notarize steps are dead (apple.py has no such subcommand) and stay untouched.
+
+Release recipe (identity by SHA-1 so no spaces reach cmake; `security
+find-identity -v -p codesigning` prints it; build.py has no flag for the
+profile, set it in the cache once):
+
+    ID=E692F20010AFEFAECCDBAA06497538ADF6ECDB42     # Developer ID Application: ... (Z9HUH3VGHM)
+    cmake -DCABLY_NOTARY_PROFILE=cably-app <build-dir>   # optional: notarize inside the build
+    rm -f <build-dir>/kicad/src/kicad-stamp/kicad-{sign-app,done}      # re-sign an existing build
+    ./build.py … --target kicad --signing-certificate-id $ID --signing-identity $ID --hardened-runtime
+    rm -f <build-dir>/package-kicad-unified/src/package-kicad-unified-stamp/package-kicad-unified-* \
+          <build-dir>/CMakeFiles/package-kicad-unified-complete
+    ./build.py … --target package-kicad-unified --jobs 4 (same signing flags)
+    cably/tests/signed.sh <build-dir>/dmg/<newest>.dmg
+
+Measured 2026-09-05: signing 96 s; app notarization 79 min for the team's FIRST
+submission (zip 18 s, upload 86 s), the DMG's 6 min; packaging ~2 min; the whole
+release run ≈ 1 h 40 min, all of it waiting on Apple — `notarize.sh` gives up
+after `CABLY_NOTARY_TIMEOUT` (default 5400 s) and prints the `notarytool info`
+command to resume by hand (the submission keeps running server-side; staple it
+yourself and `touch` the `kicad-notarize-app` stamp).
+
+Without the cache profile, notarize by hand between the two build.py runs and
+after the second: `cably/toolchain/notarize.sh <build-dir>/kicad-dest/KiCad.app`,
+then `cably/toolchain/notarize.sh <build-dir>/dmg/<file>.dmg`. Deleting only the
+`kicad-sign-app` + `kicad-done` stamps re-runs just the signing (verified: the
+other kicad-* stamps are untouched, nothing is recompiled or re-installed); any
+other kicad-* stamp re-copies the framework and undoes the seal hygiene.
 
 ## The DMG presents "Cably Desktop" (F6, 2026-09-03)
 
