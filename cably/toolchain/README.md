@@ -9,7 +9,7 @@ inside the kicad-mac-builder checkout). What the patch does and why, verified 20
 2. `install-packages3d-into-app` is a no-op — the multi-GB 3D-model clone is packaging
    data (F6), not a build input, and it parked the whole compile.
 3. `install-docs-into-app` copies only if the docs tree exists (`--skip-docs-update`).
-4. `sign-app` is tolerant — dev builds stay linker ad-hoc-signed; F6 signs with Developer ID.
+4. `sign-app` is tolerant only for ad-hoc dev builds (they stay linker ad-hoc-signed); with a Developer ID (`--signing-certificate-id`) it is strict — see the release recipe below.
 
 Homebrew prerequisites beyond the toolchain's own `ci/src/brew_deps.sh`:
 `brew install cmake ninja swig python@3.12` (the `cmake` CASK is not enough — the formula
@@ -75,7 +75,7 @@ Delete the stamps of the steps that must rerun, then run the same command:
 (keep `kicad-configure`: the inner `make` re-runs CMake by itself when a CMakeLists changes).
 An incremental install does not remove files it no longer generates — e.g. the pre-F2
 `PCB Editor.app` launcher symlinks in `kicad-dest/` — delete those by hand.
-The sign-app step is tolerant on purpose: `codesign --sign -` with entitlements fails on
+For ad-hoc dev builds the sign-app step is tolerant on purpose: `codesign --sign -` with entitlements fails on
 macOS 26 for the embedded Python.framework ("bundle format unrecognized"), the message is
 logged and the dev build keeps its linker ad-hoc signature (F6 signs with a Developer ID).
 
@@ -162,7 +162,7 @@ profile, set it in the cache once):
 
     ID=E692F20010AFEFAECCDBAA06497538ADF6ECDB42     # Developer ID Application: ... (Z9HUH3VGHM)
     cmake -DCABLY_NOTARY_PROFILE=cably-app <build-dir>   # optional: notarize inside the build
-    rm -f <build-dir>/kicad/src/kicad-stamp/kicad-{sign-app,done}      # re-sign an existing build
+    rm -f <build-dir>/kicad/src/kicad-stamp/kicad-{sign-app,notarize-app,done}   # re-sign (and re-notarize) an existing build
     ./build.py … --target kicad --signing-certificate-id $ID --signing-identity $ID --hardened-runtime
     rm -f <build-dir>/package-kicad-unified/src/package-kicad-unified-stamp/package-kicad-unified-* \
           <build-dir>/CMakeFiles/package-kicad-unified-complete
