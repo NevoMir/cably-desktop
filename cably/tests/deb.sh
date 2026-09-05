@@ -34,7 +34,10 @@
 #      <N>-g<rev>[-dirty] the packaged kicad-cli itself reports (`version --format
 #      about`, run from the extracted tree where its libraries load, i.e. in the build
 #      container, and always after the install in (b)) equals the package Version's:
-#      the name must not lie about the binaries; Architecture
+#      the name must not lie about the binaries (the report is read with
+#      cably/linux/deb-version.sh, so a release-tag form v10.0.6-cably.<M>-<n>-g<rev>
+#      counts M+n; exactly on a tag it carries no rev and only N and dirty are compared);
+#      Architecture
 #      = this dpkg's, Maintainer Cably <dev@cably.dev>, Description first line
 #      "Cably Desktop, based on KiCad", Depends naming libsecret-1-0 and the wx/GTK
 #      runtime; contents: /opt/cably-desktop/bin/{kicad,kicad-cli}, the org.cably.desktop
@@ -68,6 +71,10 @@ PKG=cably-desktop
 fail=0; ok(){ echo "  ok   $1"; }; bad(){ echo "  FAIL $1"; fail=1; }
 section(){ echo; echo "== $1"; }
 REV_CHECK_AFTER_INSTALL=0   # inner() sets 1: the packaged kicad-cli cannot run before the install there
+# The record parser package-deb.sh derives the Version with (cably_deb_parse_record).
+[ -f "$FORK/cably/linux/deb-version.sh" ] || { echo "deb.sh: no $FORK/cably/linux/deb-version.sh (set CABLY_FORK to the source tree)"; echo "deb.sh: FAIL"; exit 1; }
+# shellcheck source=../linux/deb-version.sh
+. "$FORK/cably/linux/deb-version.sh"
 
 # The next build of the same day, as dpkg will see it: N+1 when the Version carries a
 # commit count, the rev 0000000000 either way (a hash may well be smaller than this one's).
@@ -76,17 +83,22 @@ synth_later(){ # $1 Version
   else sed -E 's/[0-9a-f]{7,}$/0000000000/' <<<"$1"; fi
 }
 # What the binaries say they are (KiCad's `git describe --dirty` at build time, the
-# "Version:" line of `kicad-cli version --format about`, e.g. 10.0.6-24-g77d2f34d53[-dirty])
-# against the package Version's <N>.g<rev>[.dirty].
+# "Version:" line of `kicad-cli version --format about`, e.g. 10.0.6-24-g77d2f34d53[-dirty]
+# or v10.0.6-cably.26-2-gec55de20a0, read with cably_deb_parse_record: N counts from the
+# KiCad tag either way) against the package Version's <N>.g<rev>[.dirty].  A binary built
+# exactly on a tag reports no rev (v10.0.6-cably.26): then N and dirty are compared.
 rev_check(){ # $1 kicad-cli's version string  $2 the package Version  $3 which kicad-cli
   local BV="$1" V="$2" WHERE="$3" bc="" br="" bd="" pc="" pr="" pd=""
-  if [[ "$BV" =~ ^[0-9][0-9.]*-([0-9]+)-g([0-9a-f]+)(-dirty)?$ ]]; then bc=${BASH_REMATCH[1]}; br=${BASH_REMATCH[2]}; bd=${BASH_REMATCH[3]}
-  else bad "$WHERE reports '$BV', not <tag>-<N>-g<rev>[-dirty]: cannot compare with the package Version"; return; fi
+  if cably_deb_parse_record "$BV" "" ""; then bc=$DV_COUNT; br=$DV_REV; bd=${DV_DIRTY:+-dirty}
+  else bad "$WHERE reports '$BV', not a git-describe record deb-version.sh understands (10.0.6-<N>-g<rev>, v10.0.6-cably.<M>[-<N>-g<rev>] or 10.0.6, each [-dirty]): cannot compare with the package Version"; return; fi
   if [[ "$V" =~ \.([0-9]+)\.g([0-9a-f]+)(\.dirty)?$ ]]; then pc=${BASH_REMATCH[1]}; pr=${BASH_REMATCH[2]}; pd=${BASH_REMATCH[3]:+-dirty}
   elif [[ "$V" =~ \.([0-9a-f]{7,})$ ]]; then pr=${BASH_REMATCH[1]}
   else bad "package Version '$V' carries no rev to compare with $WHERE's $BV"; return; fi
-  if [ "$pr" = "$br" ] && [ "${pc:-$bc}" = "$bc" ] && [ "$pd" = "$bd" ]; then ok "$WHERE reports $BV = the package Version's ${pc:-?}.g$pr${pd:+.dirty}"
-  else bad "$WHERE reports $BV but the package Version says N=${pc:-?} rev $pr${pd:+ dirty}: the name lies about the binaries"; fi
+  if [ -z "$br" ]; then
+    if [ "${pc:-$bc}" = "$bc" ] && [ "$pd" = "$bd" ]; then ok "$WHERE reports $BV (form $DV_FORM: exactly on a tag, no rev in the report) = the package Version's N=$bc${pd:+, dirty}; rev $pr not comparable"
+    else bad "$WHERE reports $BV (N=$bc${bd:+, dirty}) but the package Version says N=${pc:-?}${pd:+ dirty}: the name lies about the binaries"; fi
+  elif [ "$pr" = "$br" ] && [ "${pc:-$bc}" = "$bc" ] && [ "$pd" = "$bd" ]; then ok "$WHERE reports $BV (form $DV_FORM, N=$bc) = the package Version's ${pc:-?}.g$pr${pd:+.dirty}"
+  else bad "$WHERE reports $BV (form $DV_FORM: N=$bc rev $br${bd:+ dirty}) but the package Version says N=${pc:-?} rev $pr${pd:+ dirty}: the name lies about the binaries"; fi
 }
 
 # (a) ------------------------------------------------------------------------------

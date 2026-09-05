@@ -63,6 +63,21 @@ image.
   day would let a later build of an older commit win). `deb.sh` checks the ordering with
   `dpkg --compare-versions` and that the packaged `kicad-cli version --format about`
   reports the same `<N>-g<rev>[-dirty]`.
+  `N` always counts from the KiCad tag, whichever tag `git describe` found - the record
+  changes form once a release tag `v10.0.6-cably.<M>` (M = that commit's own N) is the
+  nearest tag, and the count must not restart there or dpkg would see a downgrade.
+  `deb-version.sh` (sourced by `package-deb.sh` and `deb.sh`; `cably/tests/deb-version.sh`
+  pins it) reads the four forms:
+
+  | build record (`kicad-cli version`) | N | rev |
+  |---|---|---|
+  | `10.0.6-<n>-g<rev>[-dirty]` | n | the record's |
+  | `v10.0.6-cably.<M>-<n>-g<rev>[-dirty]` | M + n (`v10.0.6-cably.26-2-gec55de20a0` -> 28) | the record's |
+  | `v10.0.6-cably.<M>[-dirty]` (built exactly on the release tag) | M | `KICAD_COMMIT_HASH` from the same header, else the tag's commit in the checkout, else its HEAD (the log says which) |
+  | `10.0.6[-dirty]` (built exactly on the KiCad tag) | 0 | as above |
+
+  Anything else is the warned `git describe` fallback in the checkout, parsed the same
+  way; a string neither understands fails the packaging loudly.
 - `make-icons.sh` renders `cably/icons/src/*.svg` into `icons/hicolor` (the PNGs are
   committed; rerun after editing an SVG; needs `rsvg-convert`).
 - `CablyLinuxNames.cmake` is the product's desktop identity (`org.cably.desktop*`

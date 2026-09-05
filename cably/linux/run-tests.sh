@@ -44,11 +44,13 @@
 #      (xvfb-run -a), is still alive after 12 s, and exits on SIGTERM.
 #  (5) cably/tests/identity-linux.sh on the installed tree: launchers, icons, metainfo
 #      and binaries present the product as Cably Desktop, based on KiCad.
-#  (6) cably/linux/package-deb.sh writes the .deb into $CABLY_DEB_DIR (default
-#      $CABLY_BUILD_DIR/deb) and cably/tests/deb.sh checks it: the static assertions
-#      here, and the fresh-Ubuntu install + launch + theme.sh when a Docker daemon (or
-#      root) is available - inside the build container that phase is reported as a WARN
-#      with the command to run on the Docker host.
+#  (6) Static first: cably/tests/deb-version.sh pins the .deb version parser
+#      (cably/linux/deb-version.sh: the KiCad-tag and release-tag forms of the build
+#      record, the dpkg ordering).  Then cably/linux/package-deb.sh writes the .deb into
+#      $CABLY_DEB_DIR (default $CABLY_BUILD_DIR/deb) and cably/tests/deb.sh checks it:
+#      the static assertions here, and the fresh-Ubuntu install + launch + theme.sh when
+#      a Docker daemon (or root) is available - inside the build container that phase is
+#      reported as a WARN with the command to run on the Docker host.
 set -uo pipefail
 FORK="${CABLY_FORK:-/src}"
 BUILD="${CABLY_BUILD_DIR:-/build}"
@@ -168,7 +170,10 @@ if CABLY_FORK="$FORK" CABLY_PREFIX="$PREFIX" bash "$FORK/cably/tests/identity-li
 else sed 's/^/     /' "$T/identity.log" | grep -vE "^     +ok"; bad "identity-linux.sh: FAIL ($(grep -c '^  FAIL' "$T/identity.log") failing checks, see above)"; fi
 
 # (6) ----------------------------------------------------------------------------
-section "(6) cably/linux/package-deb.sh -> $DEBDIR, then cably/tests/deb.sh"
+section "(6) cably/tests/deb-version.sh (static), cably/linux/package-deb.sh -> $DEBDIR, then cably/tests/deb.sh"
+if CABLY_FORK="$FORK" bash "$FORK/cably/tests/deb-version.sh" >"$T/deb-version.log" 2>&1; then
+  ok "deb-version.sh: PASS ($(grep -c '^  ok' "$T/deb-version.log") checks)"
+else sed 's/^/     /' "$T/deb-version.log" | grep -vE "^     +ok"; bad "deb-version.sh: FAIL ($(grep -c '^  FAIL' "$T/deb-version.log") failing checks, see above)"; fi
 if [ -f "$BUILD/CMakeCache.txt" ] && [ -x "$PREFIX/bin/kicad" ]; then
   T0=$(date +%s)
   if CABLY_FORK="$FORK" CABLY_BUILD_DIR="$BUILD" CABLY_PREFIX="$PREFIX" CABLY_DEB_DIR="$DEBDIR" bash "$FORK/cably/linux/package-deb.sh" >"$T/deb-build.log" 2>&1; then

@@ -29,7 +29,11 @@
 # binaries print as `kicad-cli version`), never from the source checkout: a checkout can
 # move on after the build, and the package name must say what the binaries are.  Only a
 # build tree without that record (a tarball build) falls back to `git describe --dirty`
-# in $CABLY_FORK, with a warning.
+# in $CABLY_FORK, with a warning.  N counts from the KiCad tag whatever tag describe
+# found: once a release tag v10.0.6-cably.<M> is the nearest one, the record reads
+# v10.0.6-cably.<M>-<n>-g<rev> and N = M + n (exactly on the tag: v10.0.6-cably.<M>,
+# N = M, rev = the record's KICAD_COMMIT_HASH) - cably/linux/deb-version.sh, sourced
+# here, lists the four forms; cably/tests/deb-version.sh pins them.
 #   Why a commit count and not a time of day: dpkg compares runs of digits numerically and
 # everything else as text, so with the bare hex rev after the day a later build of the
 # same day sorted as a DOWNGRADE whenever its hash happened to be smaller
@@ -81,23 +85,30 @@ mkdir -p "$OUTDIR"
 
 ARCH=$(dpkg --print-architecture)
 # What the build tree compiled: KICAD_VERSION in kicad_build_version.h (kicad_build_version.txt
-# is the same string), <tag>-<N>-g<rev>[-dirty].  The source checkout is only a fallback.
-RECORD=""; RECORD_FROM=""
+# is the same string) - KiCad's `git describe --dirty` - plus KICAD_COMMIT_HASH from the
+# same header for a record that names a tag exactly (no -g<rev> in it).  The parser,
+# cably/linux/deb-version.sh, knows the KiCad-tag and the release-tag forms; the source
+# checkout is only a fallback.
+# shellcheck source=deb-version.sh
+. "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/deb-version.sh"
+RECORD=""; RECORD_FROM=""; RECORD_HASH=""
 if [ -f "$BUILD/kicad_build_version.h" ]; then
   RECORD=$(sed -n 's/^#define KICAD_VERSION  *"\([^"]*\)".*/\1/p' "$BUILD/kicad_build_version.h" | head -1); RECORD_FROM="$BUILD/kicad_build_version.h"
+  RECORD_HASH=$(sed -n 's/^#define KICAD_COMMIT_HASH  *"\([^"]*\)".*/\1/p' "$BUILD/kicad_build_version.h" | head -1)
 fi
 if [ -z "$RECORD" ] && [ -f "$BUILD/kicad_build_version.txt" ]; then
   RECORD=$(tr -d '\n\r' <"$BUILD/kicad_build_version.txt"); RECORD_FROM="$BUILD/kicad_build_version.txt"
 fi
-DESCRIBE_RE='^([0-9][0-9.]*)-([0-9]+)-g([0-9a-f]+)(-dirty)?$'
-if [[ "$RECORD" =~ $DESCRIBE_RE ]]; then
-  echo "package-deb.sh: build tree records $RECORD ($RECORD_FROM)"
+if cably_deb_parse_record "$RECORD" "$SRC" "$RECORD_HASH"; then
+  echo "package-deb.sh: build tree records $RECORD ($RECORD_FROM): form $DV_FORM, $DV_COUNT commits since KiCad $DV_UPSTREAM, rev ${DV_REV:-none} from $DV_REV_FROM${DV_DIRTY:+, dirty}"
 else
-  echo "package-deb.sh: WARNING: no <tag>-<N>-g<rev> record in the build tree at $BUILD (found '${RECORD:-nothing}'): falling back to git describe in $SRC - the package name is then the checkout's, not necessarily the binaries'"
+  echo "package-deb.sh: WARNING: no git-describe record in the build tree at $BUILD (found '${RECORD:-nothing}'; want 10.0.6-<N>-g<rev>, v10.0.6-cably.<M>[-<N>-g<rev>] or 10.0.6, each [-dirty]): falling back to git describe in $SRC - the package name is then the checkout's, not necessarily the binaries'"
   RECORD=$(git -C "$SRC" describe --dirty 2>/dev/null || true)
-  [[ "$RECORD" =~ $DESCRIBE_RE ]] || { echo "package-deb.sh: cannot derive <tag>-<N>-g<rev> from '$RECORD' either"; exit 1; }
+  cably_deb_parse_record "$RECORD" "$SRC" "" || { echo "package-deb.sh: cannot derive the version from '$RECORD' either"; exit 1; }
+  echo "package-deb.sh: git describe in $SRC says $RECORD: form $DV_FORM, $DV_COUNT commits since KiCad $DV_UPSTREAM, rev ${DV_REV:-none} from $DV_REV_FROM${DV_DIRTY:+, dirty}"
 fi
-UPSTREAM=${BASH_REMATCH[1]}; NCOMMITS=${BASH_REMATCH[2]}; REV=${BASH_REMATCH[3]}; DIRTY=${BASH_REMATCH[4]:+.dirty}
+[ -n "$DV_REV" ] || { echo "package-deb.sh: '$RECORD' names a tag but no commit, and nothing resolves it ($DV_REV_FROM)"; exit 1; }
+UPSTREAM=$DV_UPSTREAM; NCOMMITS=$DV_COUNT; REV=$DV_REV; DIRTY=${DV_DIRTY:+.dirty}
 SEMVER=$(sed -n 's/^set( *KICAD_SEMANTIC_VERSION *"\([^"]*\)" *)/\1/p' "$SRC/cmake/KiCadVersion.cmake" | head -1)
 [ -z "$SEMVER" ] || [ "$SEMVER" = "$UPSTREAM" ] || echo "package-deb.sh: WARNING: the build descends from tag $UPSTREAM but $SRC/cmake/KiCadVersion.cmake says $SEMVER: the checkout is not what was built"
 VERSION="${CABLY_DEB_VERSION:-$UPSTREAM+cably.$(date -u +%Y%m%d).$NCOMMITS.g$REV$DIRTY}"
