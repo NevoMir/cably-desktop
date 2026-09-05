@@ -1,5 +1,5 @@
 diff --git a/kicad-mac-builder/bin/package.sh b/kicad-mac-builder/bin/package.sh
-index b059e7f..8c599a2 100755
+index b059e7f..35f214e 100755
 --- a/kicad-mac-builder/bin/package.sh
 +++ b/kicad-mac-builder/bin/package.sh
 @@ -40,7 +40,13 @@ setup_dmg()
@@ -108,17 +108,43 @@ index b059e7f..8c599a2 100755
          fi
      ;;
      *)
-@@ -258,10 +294,10 @@ case "${PACKAGE_TYPE}" in
+@@ -258,10 +294,35 @@ case "${PACKAGE_TYPE}" in
        exit 1
      ;;
      unified)
 -        mkdir -p "${MOUNTPOINT}"/KiCad
 -        rsync -al "${KICAD_INSTALL_DIR}"/* "${MOUNTPOINT}"/KiCad/. # IMPORTANT: must preserve symlinks
-+        mkdir -p "${MOUNTPOINT}/${PRODUCT_DIR}"
-+        rsync -al "${KICAD_INSTALL_DIR}"/* "${MOUNTPOINT}/${PRODUCT_DIR}"/. # IMPORTANT: must preserve symlinks
-         echo "Moving demos"
+-        echo "Moving demos"
 -        mv "${MOUNTPOINT}"/KiCad/demos "${MOUNTPOINT}"/
-+        mv "${MOUNTPOINT}/${PRODUCT_DIR}"/demos "${MOUNTPOINT}"/
++        # Cably F6 (2026-09-05): the REAL bundle goes to the top level under the
++        # product name (the toolchain hard-codes KiCad.app during build/install;
++        # the rename happens only here), the six editor launcher symlinks are
++        # re-pointed at it inside the product folder, and demos go there too.
++        # Nothing in the image may be named KiCad.app.
++        rsync -al "${KICAD_INSTALL_DIR}/KiCad.app/" "${MOUNTPOINT}/${PRODUCT_DIR}.app/" # IMPORTANT: must preserve symlinks
++        mkdir -p "${MOUNTPOINT}/${PRODUCT_DIR}"
++        for l in "${KICAD_INSTALL_DIR}"/*.app; do
++            [ -L "${l}" ] || continue
++            name="$(basename "${l}")"
++            target="$(readlink "${l}")"
++            case "${name}" in "${PRODUCT_DIR}.app") continue ;; esac   # the build tree's symlink to KiCad.app
++            case "${target}" in
++                KiCad.app/Contents/Applications/*.app)
++                    ln -s "../${PRODUCT_DIR}.app/${target#KiCad.app/}" "${MOUNTPOINT}/${PRODUCT_DIR}/${name}"
++                ;;
++                *)
++                    echo "Unexpected launcher symlink ${name} -> ${target}"
++                    exit 1
++                ;;
++            esac
++        done
++        echo "Copying demos"
++        rsync -al "${KICAD_INSTALL_DIR}/demos/" "${MOUNTPOINT}/${PRODUCT_DIR}/demos/"
++        if find "${MOUNTPOINT}" -iname '*kicad.app*' | grep -q .; then
++            echo "Something in the image is still named KiCad.app:"
++            find "${MOUNTPOINT}" -iname '*kicad.app*'
++            exit 1
++        fi
      ;;
      *)
          echo "PACKAGE_TYPE must be \"unified\"."

@@ -986,10 +986,22 @@ print(\"%s\"%sysconfig.get_path('platlib', vars={'platbase': '.'}, scheme=scheme
 endif()
 
 if( APPLE )
+    # Cably: kicad/CMakeLists.txt copies ${PYTHON_FRAMEWORK} verbatim into
+    # Contents/Frameworks/ (cp -RP), so it must be the framework ROOT; a
+    # Versions/<X.Y> directory lands as Contents/Frameworks/<X.Y> and the app
+    # starts with an empty Python.framework (no stdlib: fatal init).
+    if( PYTHON_FRAMEWORK AND NOT PYTHON_FRAMEWORK MATCHES "Python\\.framework/?$" )
+        message( FATAL_ERROR "PYTHON_FRAMEWORK must be the framework root (.../Python.framework), got: ${PYTHON_FRAMEWORK}" )
+    endif()
+
     set( OSX_BUNDLE_PYTHON_SITE_PACKAGES_DIR ${OSX_BUNDLE_LIB_DIR}/Python.framework/Versions/${PYTHON_VERSION_MAJOR}.${PYTHON_VERSION_MINOR}/lib/python${PYTHON_VERSION_MAJOR}.${PYTHON_VERSION_MINOR}/site-packages)
     set( OSX_BUNDLE_INSTALL_PYTHON_SITE_PACKAGES_DIR "${OSX_BUNDLE_INSTALL_DIR}/${OSX_BUNDLE_PYTHON_SITE_PACKAGES_DIR}")
+    # Cably: FORCE, so the path follows the Python actually found by THIS
+    # configure. Without it the first configure's value (whatever python3 was
+    # on PATH then) stuck in the cache and pcbnew.py/_pcbnew.so were installed
+    # under a Versions/<other X.Y> that Current then pointed at.
     set( PYTHON_DEST "${OSX_BUNDLE_BUILD_DIR}/${OSX_BUNDLE_PYTHON_SITE_PACKAGES_DIR}"
-        CACHE PATH "Python module install path."
+        CACHE PATH "Python module install path." FORCE
         )
 
     add_compile_definitions( OSX_BUNDLE_PYTHON_SITE_PACKAGES_DIR="${OSX_BUNDLE_PYTHON_SITE_PACKAGES_DIR}" )

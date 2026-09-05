@@ -15,17 +15,50 @@ Homebrew prerequisites beyond the toolchain's own `ci/src/brew_deps.sh`:
 `brew install cmake ninja swig python@3.12` (the `cmake` CASK is not enough — the formula
 must be on /opt/homebrew/bin).
 
-Build command (from the kicad-mac-builder checkout; `FW` is Homebrew's framework Python):
+## The embedded Python (2026-09-05)
 
-    FW=/opt/homebrew/opt/python@3.12/Frameworks/Python.framework/Versions/3.12
+The app bundles a complete, self-contained Python.framework — the one the
+binaries are linked against and the one `Contents/Frameworks/` ships. It is NOT
+Homebrew's (`python@3.12` links five Homebrew dylibs — libmpdec, libcrypto.3,
+libssl.3, libsqlite3, liblzma — and a bundle built against it dies on any other
+Mac). It is python.org's macOS installer framework, made relocatable by
+`cably/toolchain/prepare-python-framework.sh` (arch-thinned, every load command
+rewritten to `@rpath/Versions/3.12/...`, ad-hoc re-signed; the same layout the
+official KiCad app ships):
+
+    curl -LO https://www.python.org/ftp/python/3.12.10/python-3.12.10-macos11.pkg
+    shasum -a 256 python-3.12.10-macos11.pkg
+    # 8373e58da4ea146b3eb1c1f9834f19a319440b6b679b06050b1f9ee3237aa8e4  (45,720,356 bytes)
+    bash <this repo>/cably/toolchain/prepare-python-framework.sh \
+      python-3.12.10-macos11.pkg <...>/build.noindex/python arm64
+    # -> <...>/build.noindex/python/Python.framework (86 MB), prints the cmake args
+
+(3.12.11+ are security-only releases without an installer; 3.12.10 is the last
+with one.) `-DPYTHON_FRAMEWORK` MUST be the framework ROOT (`.../Python.framework`):
+`kicad/CMakeLists.txt` copies that path verbatim into `Contents/Frameworks/`, and
+the fork's `CMakeLists.txt` now refuses a `Versions/<X.Y>` directory. `PYTHON_DEST`
+(where pcbnew.py/_pcbnew.so are installed) is FORCEd from the Python found by the
+current configure; it used to stick from the first configure's PATH python3.
+
+Build command (from the kicad-mac-builder checkout; `PYFW` is the prepared framework):
+
+    PYFW=<...>/build.noindex/python/Python.framework
+    FW=$PYFW/Versions/3.12
     PATH=/opt/homebrew/bin:$PATH nice -n 10 ./build.py --arch=arm64 \
       --kicad-source-dir=<this repo> --build-dir=<...>/build.noindex --jobs 6 \
       --target kicad --skip-docs-update --no-retry-failed-build \
-      "--extra-kicad-cmake-args=-DPYTHON_EXECUTABLE=$FW/bin/python3.12;-DPYTHON_LIBRARY=$FW/Python;-DPYTHON_INCLUDE_DIR=$FW/include/python3.12;-DPYTHON_FRAMEWORK=$FW;-DKICAD_SCRIPTING_WXPYTHON=OFF"
+      "--extra-kicad-cmake-args=-DPYTHON_EXECUTABLE=$FW/bin/python3.12;-DPYTHON_LIBRARY=$FW/Python;-DPYTHON_INCLUDE_DIR=$FW/include/python3.12;-DPYTHON_FRAMEWORK=$PYFW;-DKICAD_SCRIPTING_WXPYTHON=OFF"
 
 The extra args MUST be one semicolon-separated list passed in `=` form (argparse + CMake list
 splicing). Output: `<build-dir>/kicad-dest/KiCad.app` (+ the per-editor .app launchers).
 Keep the build dir under a `*.noindex` name so Spotlight ignores ~10 GB of objects.
+Acceptance for portability: `cably/tests/portable.sh` (kicad-mac-builder's
+`bin/verify-app.sh` rule plus the Python-framework layout and a launch) — run it
+after EVERY rebuild; the toolchain never runs verify-app.sh itself.
+Changing the Python (or any `-D` in the extra args) is a configure change: delete
+`kicad/src/kicad-stamp/kicad-configure` too, and `rm -rf kicad/src/kicad-build
+kicad-dest/KiCad.app` — an incremental install never removes a stale
+`Contents/Frameworks/<X.Y>` or `Versions/<other>` tree.
 
 Acceptance (F1): the app launches; `KiCad.app/Contents/MacOS/kicad-cli pcb export gerbers`
 on the D1 fixture board is byte-identical to the official KiCad's output modulo version/date
@@ -61,11 +94,14 @@ was rebuilt, delete its stamps first:
     rm -f <build-dir>/package-kicad-unified/src/package-kicad-unified-stamp/package-kicad-unified-* \
           <build-dir>/CMakeFiles/package-kicad-unified-complete
 
-Output: `<build-dir>/dmg/cably-desktop-<kicad version>-<date>-<rev>.dmg` (~270 MB
-compressed): the product folder holding `KiCad.app` (the bundle directory the
-toolchain addresses by that path; its identity is org.cably.desktop / "Cably
-Desktop"), `kicad-cli` 10.0.6, the `Cably Desktop.app` and `Cably *.app` launcher
-symlinks, the symbol and footprint libraries, no 3D models; `demos/` next to it.
+Output: `<build-dir>/dmg/cably-desktop-<kicad version>-<date>-<rev>.dmg` (~300 MB
+compressed). Top level (2026-09-05): the REAL bundle as `Cably Desktop.app`
+(renamed from the toolchain's hard-coded `KiCad.app` only in this packaging
+step; identity org.cably.desktop / "Cably Desktop", symbol + footprint libraries,
+`kicad-cli` in Contents/MacOS, the embedded Python.framework, no 3D models), the
+`Applications` symlink, and the folder `Cably Desktop/` holding the six editor
+launcher symlinks re-pointed to `../Cably Desktop.app/Contents/Applications/<x>.app`
+plus `demos/`. Nothing in the image is named KiCad.app.
 Still to do: Developer ID signing + notarization (the ad-hoc sign step is
 tolerated); 3D models as a separate package.
 
@@ -84,7 +120,8 @@ in the fork:
     cably/icons/src/dmg-background.svg              the window background (660x400)
 
 Template contents (volume "Cably Desktop"): `Applications -> /Applications`,
-`Cably Desktop/` (package.sh fills it), `demos/`, `.background.png` (rendered
+`Cably Desktop/` (package.sh fills it with the launchers and demos; the bundle
+itself is placed at the top level by package.sh), `.background.png` (rendered
 from the SVG with rsvg-convert), `.VolumeIcon.icns` (= `kicad/kicad.icns`, the
 Cably mark; custom-icon flag set on the root), and a `.DS_Store` written by
 `make-ds-store.py` — the same Buddy-allocator/B-tree layout the ds_store +
@@ -92,8 +129,8 @@ mac_alias libraries (dmgbuild) produce: window {{100,100},{660,400}}, no
 toolbar/sidebar, icon view 96 px, background = an Alias-v2 record of
 `.background.png` on the volume (verified to resolve through
 `CFURLCreateBookmarkDataFromAliasRecord` + `URL(resolvingBookmarkData:)` while
-the image is mounted at /Volumes/Cably Desktop), icons at Cably Desktop (165,170),
-Applications (495,170), demos (330,300).
+the image is mounted at /Volumes/Cably Desktop), icons at Cably Desktop.app
+(165,170), Applications (495,170), Cably Desktop (330,300).
 
 Patch hunks (in `kicad-mac-builder-macos26.patch`):
 
@@ -114,14 +151,22 @@ Patch hunks (in `kicad-mac-builder-macos26.patch`):
   (version = the built app's CFBundleShortVersionString up to the first `-`,
   i.e. the tag `cmake/KiCadVersion.cmake` derives KICAD_SEMANTIC_VERSION from;
   `git describe --abbrev=0` as fallback). `RELEASE_NAME` gives
-  `cably-desktop-<RELEASE_NAME>.dmg`.
+  `cably-desktop-<RELEASE_NAME>.dmg`. The unified copy step rsyncs
+  `<install dir>/KiCad.app/` to `<mount>/Cably Desktop.app/`, recreates each
+  `Cably *.app` launcher symlink of the install dir (skipping the build tree's
+  `Cably Desktop.app -> KiCad.app` link) inside `Cably Desktop/` with its target
+  rewritten to `../Cably Desktop.app/...`, copies `demos/` there, and fails if
+  anything in the image is still named KiCad.app.
 
 Acceptance: `cably/tests/dmg.sh [file.dmg]` (default: newest under
 `<build-dir>/dmg`) mounts read-only at a private mountpoint and asserts the file
-name, volume name, top level (folder, Applications link, nothing named KiCad),
-the bundle id inside, that the background is the render of our SVG and not
-KiCad's, the volume icon, the .DS_Store names, and that the app launches from
-the mount (alive after 12 s, exits on SIGTERM). What still says KiCad inside
-the image is attribution or a path the toolchain hard-codes: the `KiCad.app`
-bundle directory inside the product folder, `kicad-cli`, and the About/NOTICE
-texts.
+name, volume name, top level (the real `Cably Desktop.app` directory with
+Contents/MacOS/kicad, Applications link, the folder with exactly the six
+launchers resolving through `../Cably Desktop.app/...` and demos, nothing named
+KiCad at the top level and no `KiCad.app` anywhere in the volume), the bundle id,
+that the background is the render of our SVG and not KiCad's, the volume icon,
+the .DS_Store names, and that the app launches from the mount (alive after 12 s,
+exits on SIGTERM). After a rebuild also run `cably/tests/portable.sh` and
+`identity.sh` against the app inside the mounted image. What still says KiCad
+inside the image is attribution or a path the toolchain hard-codes:
+`kicad-cli`, the `kicad` executable name, and the About/NOTICE texts.

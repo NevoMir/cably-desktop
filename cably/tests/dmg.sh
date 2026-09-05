@@ -8,11 +8,17 @@
 # read-only at a private mountpoint (never /Volumes, never browsed) and asserts:
 #  1. the file name matches ^cably-desktop-.*\.dmg$;
 #  2. the volume name is "Cably Desktop" (diskutil info);
-#  3. the top level has a "Cably Desktop" folder, an "Applications" symlink to
-#     /Applications, nothing whose name contains "KiCad" (hidden entries
-#     included), and no visible entry other than {Applications, Cably Desktop,
-#     demos};
-#  4. "Cably Desktop/Cably Desktop.app" resolves to a bundle whose
+#  3. the top level has the REAL bundle "Cably Desktop.app" (a directory, not a
+#     symlink, with Contents/MacOS/kicad), an "Applications" symlink to
+#     /Applications, a "Cably Desktop" folder holding exactly the six editor
+#     launcher symlinks (each -> "../Cably Desktop.app/Contents/Applications/
+#     <x>.app", resolving to a bundle) and "demos", nothing whose name contains
+#     "KiCad" at the top level (hidden entries included), no visible entry other
+#     than {Applications, Cably Desktop, Cably Desktop.app}, and NOTHING named
+#     "KiCad.app" anywhere in the mounted volume (2026-09-05: before, the
+#     folder held the bundle under the toolchain's hard-coded "KiCad.app" name
+#     with "Cably Desktop.app" a symlink to it);
+#  4. "Cably Desktop.app" at the top level is a bundle whose
 #     CFBundleIdentifier is org.cably.desktop;
 #  5. the hidden Finder background (.background.png) is OUR image: byte-equal to
 #     a fresh rsvg-convert render of cably/icons/src/dmg-background.svg and NOT
@@ -86,6 +92,33 @@ VOL="$(diskutil info "$MP" 2>/dev/null | awk -F': *' '/Volume Name/{print $2}')"
 # 3. Top level -------------------------------------------------------------------
 [ -d "$MP/$PRODUCT" ] && [ ! -L "$MP/$PRODUCT" ] && ok "top-level folder '$PRODUCT' present" || bad "top-level folder '$PRODUCT' missing"
 [ -d "$MP/KiCad" ] && bad "top-level folder 'KiCad' still present" || true
+# the real bundle sits at the top level under the product name
+if [ -d "$MP/$PRODUCT.app" ] && [ ! -L "$MP/$PRODUCT.app" ]; then
+  ok "top-level '$PRODUCT.app' is a real directory (not a symlink)"
+  [ -x "$MP/$PRODUCT.app/Contents/MacOS/kicad" ] && ok "'$PRODUCT.app/Contents/MacOS/kicad' present" || bad "'$PRODUCT.app/Contents/MacOS/kicad' missing"
+else
+  bad "top-level '$PRODUCT.app' missing or a symlink ($(ls -ld "$MP/$PRODUCT.app" 2>/dev/null | sed 's/.* //'))"
+fi
+# the folder holds the six editor launchers (-> ../Cably Desktop.app/...) and demos, nothing else
+LAUNCHERS=("Cably Drawing Sheet Editor.app" "Cably Gerber Viewer.app" "Cably Image Converter.app" "Cably PCB Calculator.app" "Cably PCB Editor.app" "Cably Schematic Editor.app")
+for l in "${LAUNCHERS[@]}"; do
+  p="$MP/$PRODUCT/$l"
+  if [ -L "$p" ]; then
+    t="$(readlink "$p")"
+    case "$t" in "../$PRODUCT.app/Contents/Applications/"*.app)
+      [ -d "$p/Contents" ] && ok "launcher '$l' -> $t (resolves)" || bad "launcher '$l' -> $t does not resolve to a bundle" ;;
+    *) bad "launcher '$l' -> '$t' (want ../$PRODUCT.app/Contents/Applications/<x>.app)" ;;
+    esac
+  else bad "launcher '$PRODUCT/$l' missing or not a symlink"; fi
+done
+[ -d "$MP/$PRODUCT/demos" ] && ok "'$PRODUCT/demos' present" || bad "'$PRODUCT/demos' missing"
+while IFS= read -r e; do
+  case "$e" in .DS_Store) continue ;; demos) continue ;; esac
+  found=0; for l in "${LAUNCHERS[@]}"; do [ "$e" = "$l" ] && found=1; done
+  [ "$found" = 1 ] || bad "unexpected entry in '$PRODUCT/': '$e'"
+done < <(ls -A "$MP/$PRODUCT")
+KAPP="$(find "$MP" -iname '*kicad.app*' 2>/dev/null | head -3)"
+[ -z "$KAPP" ] && ok "nothing named KiCad.app anywhere in the volume" || bad "KiCad.app name inside the volume: $(echo "$KAPP" | sed "s|$MP/||" | tr '\n' ' ')"
 if [ -L "$MP/Applications" ] && [ "$(readlink "$MP/Applications")" = "/Applications" ]; then ok "Applications -> /Applications symlink present"; else bad "Applications symlink missing or wrong target ('$(readlink "$MP/Applications" 2>/dev/null)')"; fi
 kicad_named=0
 while IFS= read -r e; do
@@ -95,22 +128,22 @@ while IFS= read -r e; do
   case "$e" in *[Kk][Ii][Cc][Aa][Dd]*) bad "top-level entry names KiCad: '$e'"; kicad_named=1 ;; esac
   case "$e" in
     .*) ;;   # other hidden entries are tolerated but listed
-    "Applications"|"$PRODUCT"|demos) ;;
+    "Applications"|"$PRODUCT"|"$PRODUCT.app") ;;
     *) bad "unexpected visible top-level entry: '$e'" ;;
   esac
 done < <(ls -A "$MP")
 [ "$kicad_named" = 0 ] && ok "no top-level entry (hidden included) names KiCad: $(ls -A "$MP" | tr '\n' ' ')"
 
-# 4. The app inside the folder ---------------------------------------------------
-APP="$MP/$PRODUCT/$PRODUCT.app"
-if [ -e "$APP" ] && [ -d "$APP/Contents" ]; then
-  ok "'$PRODUCT/$PRODUCT.app' resolves to a bundle$( [ -L "$APP" ] && echo " (symlink -> $(readlink "$APP"))")"
+# 4. The app at the top level ----------------------------------------------------
+APP="$MP/$PRODUCT.app"
+if [ -e "$APP" ] && [ -d "$APP/Contents" ] && [ ! -L "$APP" ]; then
+  ok "'$PRODUCT.app' is a bundle"
   BID="$(pl "$APP/Contents/Info.plist" CFBundleIdentifier)"
   [ "$BID" = "org.cably.desktop" ] && ok "CFBundleIdentifier = org.cably.desktop" || bad "CFBundleIdentifier = '$BID' (want org.cably.desktop)"
   [ "$(pl "$APP/Contents/Info.plist" CFBundleDisplayName)" = "$PRODUCT" ] && ok "CFBundleDisplayName = '$PRODUCT'" || bad "CFBundleDisplayName = '$(pl "$APP/Contents/Info.plist" CFBundleDisplayName)'"
   [ -x "$APP/Contents/MacOS/kicad" ] && ok "executable Contents/MacOS/kicad present" || bad "Contents/MacOS/kicad missing"
 else
-  bad "'$PRODUCT/$PRODUCT.app' missing or not a bundle (folder holds: $(ls "$MP/$PRODUCT" 2>/dev/null | tr '\n' ' '))"
+  bad "'$PRODUCT.app' missing or not a real bundle (top level holds: $(ls "$MP" 2>/dev/null | tr '\n' ' '))"
 fi
 
 # 5. Background is ours ----------------------------------------------------------
@@ -157,6 +190,7 @@ PY
   }
   dsnames "$PRODUCT" && ok ".DS_Store names '$PRODUCT'" || bad ".DS_Store does not name '$PRODUCT'"
   dsnames "Applications" && ok ".DS_Store names 'Applications'" || bad ".DS_Store does not name 'Applications'"
+  dsnames "$PRODUCT.app" && ok ".DS_Store names '$PRODUCT.app'" || bad ".DS_Store does not name '$PRODUCT.app'"
   dsnames "icvp" && dsnames "backgroundImageAlias" && ok ".DS_Store carries icon-view prefs with a background alias (icvp)" || bad ".DS_Store has no icvp/backgroundImageAlias record"
   dsnames ".background.png" && ok ".DS_Store background alias points at .background.png" || bad ".DS_Store background alias does not name .background.png"
   dsnames "KiCad" && bad ".DS_Store names 'KiCad'" || ok ".DS_Store does not name KiCad"

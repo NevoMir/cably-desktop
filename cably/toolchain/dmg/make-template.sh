@@ -10,8 +10,11 @@
 #   HFS+ (GUID layout, as package.sh expects "Apple_HFS"), 200 MB read/write
 #   image (package.sh grows it with `hdiutil resize`), volume "Cably Desktop":
 #     Applications -> /Applications      symlink
-#     Cably Desktop/                     the app folder package.sh fills
-#     demos/                             package.sh moves KiCad's demos here
+#     Cably Desktop/                     package.sh fills it: the six editor
+#                                        launcher symlinks + demos/
+#     (Cably Desktop.app                 the real bundle, placed by package.sh
+#                                        at the top level; only its icon
+#                                        position is in the .DS_Store)
 #     .background.png                    rendered from cably/icons/src/dmg-background.svg
 #     .VolumeIcon.icns                   the Cably mark (kicad/kicad.icns) + the custom-icon flag
 #     .DS_Store                          window/icon layout + background alias (make-ds-store.py)
@@ -66,14 +69,14 @@ mount -t hfs -o nobrowse "$DEV" "$MNT"
 mdutil -i off "$MNT" >/dev/null 2>&1 || true
 
 ln -s /Applications "$MNT/Applications"
-mkdir "$MNT/$VOLNAME" "$MNT/demos"
+mkdir "$MNT/$VOLNAME"
 cp "$WORK/background.png" "$MNT/.background.png"
 cp "$ICNS" "$MNT/.VolumeIcon.icns"
 SetFile -a C "$MNT"                       # custom-icon flag on the volume root
 SetFile -a V "$MNT/.VolumeIcon.icns" || true
 python3 "$HERE/make-ds-store.py" write --root "$MNT" --volume-name "$VOLNAME" \
   --background .background.png --window 100,100,660,400 --icon-size 96 --text-size 12 \
-  --item "$VOLNAME=165,170" --item "Applications=495,170" --item "demos=330,300"
+  --item "$VOLNAME.app=165,170" --item "Applications=495,170" --item "$VOLNAME=330,300"
 # .DS_Store.new / .fseventsd etc. are Finder/kernel leftovers; none here (never browsed)
 ls -la "$MNT"
 echo "make-template: volume '$(diskutil info "$MNT" | awk -F': *' '/Volume Name/{print $2}')', root flags $(GetFileInfo -a "$MNT")"
